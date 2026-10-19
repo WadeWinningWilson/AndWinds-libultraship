@@ -33,6 +33,36 @@ class Window;
  */
 class Gui {
   public:
+    /**
+     * @brief Gamepad state supplied by the host program the game is embedded in (Context::IsEmbeddedInHost).
+     *
+     * Embedded, the GUI's gamepad input comes only from here: the platform backend's own gamepad (and any other
+     * window input) is discarded each frame, because the host routes input. The usual rules still apply, e.g.
+     * gamepad menu navigation needs the controller-navigation setting.
+     */
+    struct HostGamepad {
+        enum Button : uint32_t {
+            START = 1u << 0,
+            BACK = 1u << 1,
+            FACE_DOWN = 1u << 2,  ///< accept
+            FACE_RIGHT = 1u << 3, ///< cancel
+            FACE_LEFT = 1u << 4,
+            FACE_UP = 1u << 5,
+            DPAD_UP = 1u << 6,
+            DPAD_DOWN = 1u << 7,
+            DPAD_LEFT = 1u << 8,
+            DPAD_RIGHT = 1u << 9,
+            L1 = 1u << 10,
+            R1 = 1u << 11,
+        };
+        uint32_t buttons = 0;
+        float leftX = 0.0f; ///< -1..1, right positive
+        float leftY = 0.0f; ///< -1..1, up positive
+    };
+
+    /** @brief Sets the host gamepad state used from the next GUI frame (embedded only; game thread). */
+    void SetHostGamepad(const HostGamepad& pad);
+
     /** @brief Constructs a Gui with no pre-registered windows. */
     Gui();
 
@@ -234,6 +264,9 @@ class Gui {
     std::map<std::string, std::shared_ptr<GuiWindow>> mGuiWindows; ///< Registered window map (name → window).
 
   private:
+    void FeedHostInput();
+
+    HostGamepad mHostGamepad;
     bool mNeedsConsoleVariableSave;
     std::string mImGuiIniPath;
     std::string mImGuiLogPath;

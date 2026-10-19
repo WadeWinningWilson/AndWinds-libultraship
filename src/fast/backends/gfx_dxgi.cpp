@@ -928,6 +928,9 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     QueryPerformanceCounter(&t);
     int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
                    FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
+    if (Ship::Context::HostPacesFrames()) {
+        next = 0; // the host steps the game; present as soon as the frame is finished
+    }
     int64_t left = next - qpc_to_100ns(t.QuadPart) - 15000UL;
     if (left > 0) {
         LARGE_INTEGER li;

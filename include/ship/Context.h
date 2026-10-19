@@ -123,6 +123,13 @@ class Context {
     static bool IsEmbeddedInHost();
 
     /**
+     * @brief The host program decides when frames happen (it steps the game), so window backends present each
+     * finished frame immediately instead of waiting for their own frame-rate timer.
+     */
+    static void SetHostPacesFrames(bool hostPaces);
+    static bool HostPacesFrames();
+
+    /**
      * @brief Resolves a path relative to the application data directory.
      * @param path    Relative path to resolve.
      * @param appName Override the application name used to build the base path.

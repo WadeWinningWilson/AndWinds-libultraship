@@ -70,7 +70,11 @@ void ControlDeck::WriteToOSContPad(OSContPad* pad) {
     mPads = pad;
 
     if (Ship::Context::IsEmbeddedInHost()) {
-        // The host routes input; the physical controllers are its to read.
+        // The host routes input; the physical controllers are its to read. Host pads are gamepads, so they follow
+        // the gamepad rule: none reach the game while the menus are being navigated with a controller.
+        if (GamepadGameInputBlocked()) {
+            return;
+        }
         for (size_t i = 0; i < mPorts.size() && i < MAXCONTROLLERS; i++) {
             pad[i] = mHostPads[i];
         }

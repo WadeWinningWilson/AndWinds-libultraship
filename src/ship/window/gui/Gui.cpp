@@ -288,7 +288,41 @@ void Gui::StartFrame() {
     HandleMouseCapture();
     ImGuiBackendNewFrame();
     ImGuiWMNewFrame();
+    if (Context::IsEmbeddedInHost()) {
+        FeedHostInput();
+    }
     ImGui::NewFrame();
+}
+
+void Gui::SetHostGamepad(const HostGamepad& pad) {
+    mHostGamepad = pad;
+}
+
+// Embedded: the host routes input. Drop what the platform backend queued (it reads the physical gamepad and the
+// hidden window regardless of focus) and queue the host's gamepad instead.
+void Gui::FeedHostInput() {
+    mImGuiIo->ClearEventsQueue();
+    mImGuiIo->BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    static const struct {
+        uint32_t bit;
+        ImGuiKey key;
+    } kButtons[] = {
+        { HostGamepad::START, ImGuiKey_GamepadStart },        { HostGamepad::BACK, ImGuiKey_GamepadBack },
+        { HostGamepad::FACE_DOWN, ImGuiKey_GamepadFaceDown }, { HostGamepad::FACE_RIGHT, ImGuiKey_GamepadFaceRight },
+        { HostGamepad::FACE_LEFT, ImGuiKey_GamepadFaceLeft }, { HostGamepad::FACE_UP, ImGuiKey_GamepadFaceUp },
+        { HostGamepad::DPAD_UP, ImGuiKey_GamepadDpadUp },     { HostGamepad::DPAD_DOWN, ImGuiKey_GamepadDpadDown },
+        { HostGamepad::DPAD_LEFT, ImGuiKey_GamepadDpadLeft }, { HostGamepad::DPAD_RIGHT, ImGuiKey_GamepadDpadRight },
+        { HostGamepad::L1, ImGuiKey_GamepadL1 },              { HostGamepad::R1, ImGuiKey_GamepadR1 },
+    };
+    for (const auto& b : kButtons) {
+        mImGuiIo->AddKeyEvent(b.key, (mHostGamepad.buttons & b.bit) != 0);
+    }
+    const float deadZone = 0.25f;
+    auto analog = [&](ImGuiKey key, float v) { mImGuiIo->AddKeyAnalogEvent(key, v > deadZone, v > deadZone ? v : 0.0f); };
+    analog(ImGuiKey_GamepadLStickLeft, -mHostGamepad.leftX);
+    analog(ImGuiKey_GamepadLStickRight, mHostGamepad.leftX);
+    analog(ImGuiKey_GamepadLStickUp, mHostGamepad.leftY);
+    analog(ImGuiKey_GamepadLStickDown, -mHostGamepad.leftY);
 }
 
 void Gui::EndFrame() {

@@ -34,6 +34,7 @@ namespace Ship {
 // Set by a frontend that runs the game inside a host process (see SetAppDirectoryOverride, SetEmbeddedInHost).
 static std::string sAppDirectoryOverride;
 static bool sEmbeddedInHost = false;
+static bool sHostPacesFrames = false;
 std::unique_ptr<Context> Context::mContext;
 
 Context* Context::GetRawInstance() {
@@ -487,6 +488,14 @@ void Context::SetEmbeddedInHost(bool embedded) {
 
 bool Context::IsEmbeddedInHost() {
     return sEmbeddedInHost;
+}
+
+void Context::SetHostPacesFrames(bool hostPaces) {
+    sHostPacesFrames = hostPaces;
+}
+
+bool Context::HostPacesFrames() {
+    return sHostPacesFrames;
 }
 
 void Context::SetAppDirectoryOverride(const std::string& path) {
