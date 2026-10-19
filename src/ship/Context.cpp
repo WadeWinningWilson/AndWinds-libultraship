@@ -473,7 +473,17 @@ std::string Context::GetShortName() const {
     return mShortName;
 }
 
+static std::string sAppDirectoryOverride;
+
+void Context::SetAppDirectoryOverride(const std::string& path) {
+    sAppDirectoryOverride = path;
+}
+
 std::string Context::GetAppBundlePath() {
+    if (!sAppDirectoryOverride.empty()) {
+        return sAppDirectoryOverride;
+    }
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -537,6 +547,10 @@ std::string Context::GetAppBundlePath() {
 }
 
 std::string Context::GetAppDirectoryPath(const std::string& appName) {
+    if (!sAppDirectoryOverride.empty()) {
+        return sAppDirectoryOverride;
+    }
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {

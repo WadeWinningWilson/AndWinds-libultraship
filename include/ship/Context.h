@@ -104,6 +104,16 @@ class Context {
     static std::string GetAppDirectoryPath(const std::string& appName = "");
 
     /**
+     * @brief Makes GetAppBundlePath and GetAppDirectoryPath return one fixed directory.
+     *
+     * For a frontend that runs the game inside another program (a host process), where the executable's
+     * directory and the working directory belong to the host. Call before CreateInstance. Empty restores the
+     * platform default.
+     * @param path Absolute directory (UTF-8).
+     */
+    static void SetAppDirectoryOverride(const std::string& path);
+
+    /**
      * @brief Resolves a path relative to the application data directory.
      * @param path    Relative path to resolve.
      * @param appName Override the application name used to build the base path.

@@ -1,6 +1,10 @@
 include("${CMAKE_CURRENT_LIST_DIR}/Default.cmake")
 
-set_config_specific_property("OUTPUT_DIRECTORY" "${CMAKE_SOURCE_DIR}$<$<NOT:$<STREQUAL:${CMAKE_VS_PLATFORM_NAME},Win32>>:/${CMAKE_VS_PLATFORM_NAME}>/${PROPS_CONFIG}")
+# SHIP_OUTPUT_ROOT lets a second build tree (e.g. the hosted provider) keep its outputs apart.
+if(NOT SHIP_OUTPUT_ROOT)
+    set(SHIP_OUTPUT_ROOT "${CMAKE_SOURCE_DIR}")
+endif()
+set_config_specific_property("OUTPUT_DIRECTORY" "${SHIP_OUTPUT_ROOT}$<$<NOT:$<STREQUAL:${CMAKE_VS_PLATFORM_NAME},Win32>>:/${CMAKE_VS_PLATFORM_NAME}>/${PROPS_CONFIG}")
 
 if(MSVC)
     create_property_reader("DEFAULT_CXX_EXCEPTION_HANDLING")
