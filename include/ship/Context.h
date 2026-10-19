@@ -114,6 +114,15 @@ class Context {
     static void SetAppDirectoryOverride(const std::string& path);
 
     /**
+     * @brief Marks the game as running inside another program (a host process).
+     *
+     * Process-wide resources then stay the host's: logging writes only the app's own log file and never frees,
+     * allocates or redirects the process console or standard handles. Call before CreateInstance.
+     */
+    static void SetEmbeddedInHost(bool embedded);
+    static bool IsEmbeddedInHost();
+
+    /**
      * @brief Resolves a path relative to the application data directory.
      * @param path    Relative path to resolve.
      * @param appName Override the application name used to build the base path.

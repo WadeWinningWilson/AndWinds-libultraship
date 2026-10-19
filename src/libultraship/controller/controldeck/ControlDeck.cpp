@@ -49,6 +49,12 @@ OSContPad* ControlDeck::GetPads() {
     return mPads;
 }
 
+void ControlDeck::SetHostPads(const OSContPad* pads, size_t count) {
+    for (size_t i = 0; i < MAXCONTROLLERS; i++) {
+        mHostPads[i] = i < count ? pads[i] : OSContPad{};
+    }
+}
+
 void ControlDeck::WriteToPad(void* pad) {
     WriteToOSContPad((OSContPad*)pad);
 }
@@ -62,6 +68,14 @@ void ControlDeck::WriteToOSContPad(OSContPad* pad) {
     }
 
     mPads = pad;
+
+    if (Ship::Context::IsEmbeddedInHost()) {
+        // The host routes input; the physical controllers are its to read.
+        for (size_t i = 0; i < mPorts.size() && i < MAXCONTROLLERS; i++) {
+            pad[i] = mHostPads[i];
+        }
+        return;
+    }
 
     for (size_t i = 0; i < mPorts.size(); i++) {
         const std::shared_ptr<Ship::Controller> controller = mPorts[i]->GetConnectedController();

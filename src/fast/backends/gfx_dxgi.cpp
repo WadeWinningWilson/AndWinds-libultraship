@@ -37,6 +37,7 @@
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "fast/backends/gfx_dxgi.h"
+#include "fast/PresentCapture.h"
 
 #define WINCLASS_NAME L"N64GAME"
 #define GFX_BACKEND_NAME "DXGI"
@@ -605,8 +606,11 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
 
     LoadDxgi();
 
-    ShowWindow(h_wnd, SW_SHOW);
-    UpdateWindow(h_wnd);
+    // Embedded in a host program, the host presents the game; this window stays hidden.
+    if (!Ship::Context::IsEmbeddedInHost()) {
+        ShowWindow(h_wnd, SW_SHOW);
+        UpdateWindow(h_wnd);
+    }
 
     // Get refresh rate
     GetMonitorHzPeriod(mMonitor, mDetectedHz, mDisplayPeriod);
@@ -941,6 +945,7 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     }
     QueryPerformanceCounter(&t);
     mPreviousPresentTime = t;
+    CapturePresentedFrame();
     if (mTearingSupport && !mVsyncEnabled) {
         // 512: DXGI_PRESENT_ALLOW_TEARING - allows for true V-Sync off with flip model
         ThrowIfFailed(swap_chain->Present(mVsyncEnabled, DXGI_PRESENT_ALLOW_TEARING));
@@ -953,6 +958,80 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
         mPendingFrameStats.insert(std::make_pair(this_present_id, mVsyncEnabled));
     }
     mDroppedFrame = false;
+}
+
+static PresentCaptureCallback sPresentCapture = nullptr;
+static void* sPresentCaptureUser = nullptr;
+
+void SetPresentCaptureCallback(PresentCaptureCallback callback, void* user) {
+    sPresentCaptureUser = user;
+    sPresentCapture = callback;
+}
+
+void GfxWindowBackendDXGI::CapturePresentedFrame() {
+    if (sPresentCapture == nullptr || swap_chain == nullptr) {
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    if (FAILED(mSwapChainDevice.As(&device))) {
+        return; // D3D12 swap chains are not captured
+    }
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
+    if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc;
+    backBuffer->GetDesc(&desc);
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+
+    // Hand over the oldest finished copies first (each one is a frame or two behind), without waiting on the GPU.
+    for (int i = 0; i < kCaptureRing; i++) {
+        int slot = (mCaptureNext + i) % kCaptureRing; // mCaptureNext holds the oldest copy
+        if (!mCapturePending[slot]) {
+            continue;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = context->Map(mCaptureStaging[slot].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+            break; // later copies are not ready either
+        }
+        mCapturePending[slot] = false;
+        if (SUCCEEDED(hr)) {
+            D3D11_TEXTURE2D_DESC have;
+            mCaptureStaging[slot]->GetDesc(&have);
+            sPresentCapture(static_cast<const uint8_t*>(mapped.pData), have.Width, have.Height, mapped.RowPitch,
+                            sPresentCaptureUser);
+            context->Unmap(mCaptureStaging[slot].Get(), 0);
+        }
+    }
+
+    // Copy this frame into the next slot (dropping it if that slot's previous copy was never read back).
+    int slot = mCaptureNext;
+    D3D11_TEXTURE2D_DESC have = {};
+    if (mCaptureStaging[slot] != nullptr) {
+        mCaptureStaging[slot]->GetDesc(&have);
+    }
+    if (mCaptureStaging[slot] == nullptr || have.Width != desc.Width || have.Height != desc.Height ||
+        have.Format != desc.Format) {
+        D3D11_TEXTURE2D_DESC staging = desc;
+        staging.BindFlags = 0;
+        staging.MiscFlags = 0;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging.MipLevels = 1;
+        staging.ArraySize = 1;
+        staging.SampleDesc.Count = 1;
+        staging.SampleDesc.Quality = 0;
+        mCaptureStaging[slot].Reset();
+        if (FAILED(device->CreateTexture2D(&staging, nullptr, &mCaptureStaging[slot]))) {
+            mCapturePending[slot] = false;
+            return;
+        }
+    }
+    context->CopyResource(mCaptureStaging[slot].Get(), backBuffer.Get());
+    mCapturePending[slot] = true;
+    mCaptureNext = (slot + 1) % kCaptureRing;
 }
 
 void GfxWindowBackendDXGI::SwapBuffersEnd() {

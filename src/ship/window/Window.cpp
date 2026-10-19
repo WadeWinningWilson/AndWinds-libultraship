@@ -54,6 +54,9 @@ std::shared_ptr<Gui> Window::GetGui() {
 }
 
 void Window::SaveWindowToConfig() {
+    if (Context::IsEmbeddedInHost()) {
+        return; // the hidden window's geometry is not the user's; standalone keeps its own saved window
+    }
     // This accepts conf in because it can be run in the destruction of LUS.
     mConfig->SetBool("Window.Fullscreen.Enabled", IsFullscreen());
     if (IsFullscreen()) {

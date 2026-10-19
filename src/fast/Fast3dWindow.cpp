@@ -422,7 +422,9 @@ void Fast3dWindow::SetCurrentDimensions(bool isFullscreen, uint32_t width, uint3
 void Fast3dWindow::SetCurrentDimensions(bool isFullscreen, uint32_t width, uint32_t height, int32_t posX,
                                         int32_t posY) {
     auto config = Ship::Context::GetRawInstance()->GetConfig();
-    if (!isFullscreen) {
+    if (Ship::Context::IsEmbeddedInHost()) {
+        // Hidden window inside a host program: not the user's window geometry, so nothing is saved.
+    } else if (!isFullscreen) {
         config->SetInt("Window.Width", static_cast<int32_t>(width));
         config->SetInt("Window.Height", static_cast<int32_t>(height));
         config->SetInt("Window.PositionX", posX);

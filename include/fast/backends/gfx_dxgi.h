@@ -7,6 +7,7 @@
 #include <functional>
 
 #include <dxgi1_2.h>
+#include <d3d11.h>
 
 namespace Fast {
 
@@ -96,6 +97,13 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain;
     HANDLE mWaitableObject;
     Microsoft::WRL::ComPtr<IUnknown> mSwapChainDevice; // D3D11 Device or D3D12 Command Queue
+    // Present capture (fast/PresentCapture.h): a ring of CPU-readable copies of the back buffer, read back once
+    // the GPU has finished each one so the render thread never waits on the GPU.
+    static constexpr int kCaptureRing = 3;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mCaptureStaging[kCaptureRing];
+    bool mCapturePending[kCaptureRing] = {};
+    int mCaptureNext = 0;
+    void CapturePresentedFrame();
     std::function<void()> mBeforeDestroySwapChainFn;
     uint64_t mFrameTimeStamp; // in units of 1/FRAME_INTERVAL_NS_DENOMINATOR nanoseconds
     std::map<UINT, DXGI_FRAME_STATISTICS> mFrameStats;

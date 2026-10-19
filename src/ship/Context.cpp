@@ -30,6 +30,10 @@
 #endif
 
 namespace Ship {
+
+// Set by a frontend that runs the game inside a host process (see SetAppDirectoryOverride, SetEmbeddedInHost).
+static std::string sAppDirectoryOverride;
+static bool sEmbeddedInHost = false;
 std::unique_ptr<Context> Context::mContext;
 
 Context* Context::GetRawInstance() {
@@ -129,6 +133,8 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         std::vector<spdlog::sink_ptr> sinks;
 
 #if (!defined(_WIN32)) || defined(_DEBUG)
+        // Embedded in a host process: the console and standard handles are the host's.
+        if (!sEmbeddedInHost) {
 #if defined(_DEBUG) && defined(_WIN32)
         // LLVM on Windows allocs a hidden console in its entrypoint function.
         // We free that console here to create our own.
@@ -163,6 +169,7 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         auto systemConsoleSink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
         systemConsoleSink->set_level(spdlog::level::trace);
         sinks.push_back(systemConsoleSink);
+        }
 #endif
 
         auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetName() + ".log"));
@@ -473,7 +480,14 @@ std::string Context::GetShortName() const {
     return mShortName;
 }
 
-static std::string sAppDirectoryOverride;
+
+void Context::SetEmbeddedInHost(bool embedded) {
+    sEmbeddedInHost = embedded;
+}
+
+bool Context::IsEmbeddedInHost() {
+    return sEmbeddedInHost;
+}
 
 void Context::SetAppDirectoryOverride(const std::string& path) {
     sAppDirectoryOverride = path;
@@ -619,7 +633,10 @@ std::string Context::LocateFileAcrossAppDirs(const std::string& path, const std:
     if (std::filesystem::exists(fpath)) {
         return fpath;
     }
-    // current dir
+    // current dir (not when hosted: the working directory belongs to the host process)
+    if (!sAppDirectoryOverride.empty()) {
+        return GetPathRelativeToAppDirectory(path, appName);
+    }
     return "./" + std::string(path);
 }
 

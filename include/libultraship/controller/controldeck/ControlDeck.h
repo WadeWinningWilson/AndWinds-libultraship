@@ -67,6 +67,17 @@ class ControlDeck final : public Ship::ControlDeck {
      */
     void WriteToPad(void* pad) override;
 
+    /**
+     * @brief Pad state supplied by the host program the game is embedded in (Ship::Context::IsEmbeddedInHost).
+     *
+     * The host routes input there: these pads replace what the physical controllers would write, and are still
+     * subject to AllGameInputBlocked(). Call on the game thread, before the frame reads its pads.
+     *
+     * @param pads One entry per port.
+     * @param count Number of entries (at most MAXCONTROLLERS are used).
+     */
+    void SetHostPads(const OSContPad* pads, size_t count);
+
   private:
     /**
      * @brief Translates a single port's Ship::Controller state to one OSContPad entry.
@@ -75,5 +86,6 @@ class ControlDeck final : public Ship::ControlDeck {
     void WriteToOSContPad(OSContPad* pad);
 
     OSContPad* mPads; ///< OSContPad array (one entry per port), owned by this class.
+    OSContPad mHostPads[MAXCONTROLLERS] = {}; ///< See SetHostPads.
 };
 } // namespace LUS
