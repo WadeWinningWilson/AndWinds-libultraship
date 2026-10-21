@@ -270,6 +270,8 @@ void GfxWindowBackendAurora::Init(const char* gameName, const char* apiName, boo
     AuroraTrace("[lus-aurora] window: initialising Aurora (GPU API %d)", static_cast<int>(config.backend));
     mInitialized = AuroraBridge::Initialize(config, info);
     AuroraTrace("[lus-aurora] window: Aurora initialised = %d", int(mInitialized));
+    // The API Aurora actually got (same numbering as above; it may differ from the one asked for).
+    AuroraTrace("[lus-aurora] window: GPU API in use %d", static_cast<int>(info.backend));
     if (!mInitialized) {
         SPDLOG_ERROR("Aurora backend: Aurora failed to initialise");
         mIsRunning = false;
@@ -380,6 +382,13 @@ void GfxWindowBackendAurora::HandleEvents() {
     }
     for (int i = 0; i < n; ++i) {
         const auto& ev = events[i];
+        static int sMouseTraced = 0;
+        if (sMouseTraced < 12 && (ev.type == AuroraBridge::Event::Type::MouseDown || ev.type == AuroraBridge::Event::Type::MouseUp ||
+                                  ev.type == AuroraBridge::Event::Type::Text ||
+                                  (ev.type == AuroraBridge::Event::Type::MouseMove && sMouseTraced < 4))) {
+            ++sMouseTraced;
+            AuroraTrace("[lus-aurora] input event %d: a=%d b=%d", static_cast<int>(ev.type), ev.a, ev.b);
+        }
         switch (ev.type) {
             case AuroraBridge::Event::Type::Exit:
                 mIsRunning = false;

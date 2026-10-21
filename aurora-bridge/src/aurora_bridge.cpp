@@ -118,8 +118,29 @@ int Poll(Event* events, int max) {
                         out.type = Event::Type::FocusGained;
                         break;
                     case SDL_EVENT_MOUSE_MOTION: {
-                        // SDL3 reports window coordinates; libultraship's sizes are pixels.
-                        const float d = sWindow != nullptr ? SDL_GetWindowPixelDensity(sWindow) : 1.0f;
+                        // SDL3 reports window coordinates; libultraship's sizes are pixels. Scale by
+                        // the window's own pixel/coordinate ratio (on Windows with per-monitor DPI
+                        // awareness the two are the same, whatever the display scale).
+                        float d = 1.0f;
+                        if (sWindow != nullptr) {
+                            int lw = 0, lh = 0, pw = 0, ph = 0;
+                            SDL_GetWindowSize(sWindow, &lw, &lh);
+                            SDL_GetWindowSizeInPixels(sWindow, &pw, &ph);
+                            if (lw > 0 && pw > 0) {
+                                d = static_cast<float>(pw) / static_cast<float>(lw);
+                            }
+                        }
+                        static int sMotionLogged = 0;
+                        if (sMotionLogged < 3 && sLog != nullptr) {
+                            ++sMotionLogged;
+                            int lw = 0, lh = 0, pw = 0, ph = 0;
+                            SDL_GetWindowSize(sWindow, &lw, &lh);
+                            SDL_GetWindowSizeInPixels(sWindow, &pw, &ph);
+                            char msg[160];
+                            SDL_snprintf(msg, sizeof(msg), "mouse motion raw (%.1f, %.1f); window %dx%d, pixels %dx%d, density %.3f",
+                                         ev->sdl.motion.x, ev->sdl.motion.y, lw, lh, pw, ph, SDL_GetWindowPixelDensity(sWindow));
+                            sLog(LogLevel::Warning, "bridge", msg);
+                        }
                         out.type = Event::Type::MouseMove;
                         out.a = static_cast<int32_t>(ev->sdl.motion.x * d);
                         out.b = static_cast<int32_t>(ev->sdl.motion.y * d);

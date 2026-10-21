@@ -16,11 +16,55 @@
 
 #include "fast/Fast3dGui.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
+#include "ship/debug/Console.h"
 
 namespace Fast {
 
 extern void GfxSetInstance(std::shared_ptr<Interpreter> gfx);
+
+namespace {
+
+// LUS_CONSOLE_SCRIPT="<seconds>:<console command>;..." runs console commands at
+// those times after the first frame, on the game thread, with any backend. For
+// repeatable side-by-side renderer comparisons (the same steps on each backend).
+void RunConsoleScript() {
+    static std::vector<std::pair<double, std::string>> sSteps;
+    static size_t sNext = 0;
+    static bool sParsed = false;
+    static std::chrono::steady_clock::time_point sStart;
+    if (!sParsed) {
+        sParsed = true;
+        sStart = std::chrono::steady_clock::now();
+        if (const char* env = std::getenv("LUS_CONSOLE_SCRIPT")) {
+            std::string script = env;
+            size_t pos = 0;
+            while (pos < script.size()) {
+                size_t end = script.find(';', pos);
+                std::string item = script.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                const size_t colon = item.find(':');
+                if (colon != std::string::npos) {
+                    sSteps.emplace_back(std::atof(item.substr(0, colon).c_str()), item.substr(colon + 1));
+                }
+                if (end == std::string::npos) {
+                    break;
+                }
+                pos = end + 1;
+            }
+        }
+    }
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - sStart).count();
+    while (sNext < sSteps.size() && now >= sSteps[sNext].first) {
+        std::string output;
+        const int32_t result = Ship::Context::GetRawInstance()->GetConsole()->Run(sSteps[sNext].second, &output);
+        SPDLOG_INFO("Console script at {:.1f}s: \"{}\" -> {} {}", now, sSteps[sNext].second, result, output);
+        ++sNext;
+    }
+}
+
+} // namespace
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastMouseStateManager> mouseStateManager)
     : Ship::Window(gui, mouseStateManager) {
@@ -211,6 +255,8 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     if (!wnd->IsFrameReady()) {
         return false;
     }
+
+    RunConsoleScript();
 
     auto gui = wnd->GetGui();
     // Setup mouse state manager

@@ -65,6 +65,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 )";
 
+constexpr const char* DepthReadMsWgsl = R"(
+@group(0) @binding(0) var depthTex: texture_depth_multisampled_2d;
+@group(0) @binding(1) var<storage, read> coords: array<vec2i>;
+@group(0) @binding(2) var<storage, read_write> values: array<f32>;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let size = vec2i(textureDimensions(depthTex));
+  let c = clamp(coords[id.x], vec2i(0), size - vec2i(1));
+  values[id.x] = textureLoad(depthTex, c, 0);
+}
+)";
+
 // Matches struct Uniforms in the WGSL template.
 struct DrawUniforms {
     int32_t frameCount;
@@ -302,14 +314,14 @@ void GfxRenderingAPIAurora::ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs
     usedTextures[1] = p->usedTextures[1];
 }
 
-wgpu::RenderPipeline GfxRenderingAPIAurora::GetPipeline(ShaderProgramAurora* prg, bool hasDepth) {
+wgpu::RenderPipeline GfxRenderingAPIAurora::GetPipeline(ShaderProgramAurora* prg, bool hasDepth, uint32_t samples) {
     const bool depthTest = mCurrentDepthTest != 0;
     const bool depthMask = mCurrentDepthMask != 0;
     const bool decal = mCurrentZmodeDecal != 0;
     // Key: program, depth test/mask/decal, blend, target has depth.
     uint64_t key = reinterpret_cast<uintptr_t>(prg);
     key = key * 31 + (depthTest ? 1 : 0) + (depthMask ? 2 : 0) + (decal ? 4 : 0) + (mUseAlpha ? 8 : 0) +
-          (hasDepth ? 16 : 0);
+          (hasDepth ? 16 : 0) + (samples > 1 ? 32 : 0);
     auto it = mPipelines.find(key);
     if (it != mPipelines.end()) {
         return it->second;
@@ -354,6 +366,7 @@ wgpu::RenderPipeline GfxRenderingAPIAurora::GetPipeline(ShaderProgramAurora* prg
     pd.primitive.cullMode = wgpu::CullMode::None; // Fast3D culls on the CPU
     pd.fragment = &fs;
     pd.depthStencil = hasDepth ? &ds : nullptr;
+    pd.multisample.count = samples;
     auto pipeline = mDevice.CreateRenderPipeline(&pd);
     mPipelines.emplace(key, pipeline);
     return pipeline;
@@ -667,7 +680,7 @@ void GfxRenderingAPIAurora::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, s
     }
 
     DrawOp d;
-    d.pipeline = GetPipeline(mCurrentShader, static_cast<bool>(pass.depthView));
+    d.pipeline = GetPipeline(mCurrentShader, static_cast<bool>(pass.depthView), fb.samples);
     d.textures = GetTextureBindGroup();
     d.verts = AuroraBridge::Gfx::PushVerts(reinterpret_cast<const uint8_t*>(buf_vbo), buf_vbo_len * sizeof(float), 4);
     d.uniformOffset = AuroraBridge::Gfx::PushUniform(reinterpret_cast<const uint8_t*>(&u), sizeof(u)).offset;
@@ -761,11 +774,16 @@ void GfxRenderingAPIAurora::CreateSharedObjects() {
     dpd.compute.module = MakeModule(mDevice, DepthReadWgsl, "Fast3D depth read");
     dpd.compute.entryPoint = "main";
     mDepthPipeline = mDevice.CreateComputePipeline(&dpd);
+    dpd.label = "Fast3D depth read (MSAA)";
+    dpd.compute.module = MakeModule(mDevice, DepthReadMsWgsl, "Fast3D depth read (MSAA)");
+    mDepthPipelineMs = mDevice.CreateComputePipeline(&dpd);
     mInstance = mDevice.GetAdapter().GetInstance();
 }
 
 void GfxRenderingAPIAurora::Init() {
     AuroraTrace("[lus-aurora] rendering: init");
+    AuroraTrace("[lus-aurora] cvar %s = %d", CVAR_MSAA_VALUE,
+                Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_MSAA_VALUE, -1));
     mDevice = AuroraBridge::Gfx::Device();
     if (!mDevice) {
         SPDLOG_ERROR("Aurora backend: no WebGPU device");
@@ -803,6 +821,9 @@ void GfxRenderingAPIAurora::Init() {
         bd.size = 256;
         bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
         mSelfTestBuffer = mDevice.CreateBuffer(&bd);
+        if (const char* n = std::getenv("LUS_AURORA_SELFTEST_BURST")) {
+            mSelfTestBurst = static_cast<uint32_t>(std::atoi(n));
+        }
     }
 
     if (const char* v = std::getenv("LUS_AURORA_READBACK_TEST")) {
@@ -865,6 +886,7 @@ void GfxRenderingAPIAurora::BeginPass(int fb) {
     PassOp op;
     op.fb = fb;
     op.colorView = f.colorView;
+    op.msaaView = f.msaaView;
     op.depthView = f.depthView;
     mFrames[mRecordingSlot].push_back(std::move(op));
     ++mStatPasses;
@@ -916,7 +938,12 @@ void GfxRenderingAPIAurora::EndFrame() {
     const bool selfTestNow = mSelfTestAtTime > 0.0
                                  ? (!mSelfTestTaken && mWindow->GetTime() - mStartTime >= mSelfTestAtTime)
                                  : (mSelfTestFrame != 0 && mStatFrames == mSelfTestFrame);
-    if (selfTestNow) {
+    const bool burstNow = mSelfTestTaken && mSelfTestShot < mSelfTestBurst && !mSelfTestBusy.load();
+    if (selfTestNow || burstNow) {
+        if (burstNow) {
+            ++mSelfTestShot;
+        }
+        mSelfTestBusy = true;
         mSelfTestTaken = true;
         mSelfTestFrame = static_cast<uint32_t>(mStatFrames);
         gfx::ResolvedTargets snap{};
@@ -933,6 +960,8 @@ void GfxRenderingAPIAurora::EndFrame() {
             mSelfTestBuffer = mDevice.CreateBuffer(&bd);
             const SelfTestPayload sp{ this, mSelfTestTexture.Get() };
             AuroraBridge::Gfx::PushEncoderTask(mSelfTestTask, &sp, sizeof(sp));
+        } else {
+            mSelfTestBusy = false;
         }
     }
 
@@ -974,9 +1003,14 @@ void GfxRenderingAPIAurora::UpdateFramebufferParameters(int fb_id, uint32_t widt
         return;
     }
     Framebuffer& f = mFramebuffers[fb_id];
-    // E6: WebGPU has 1x and 4x only. Rendering is single-sample for now.
-    const uint32_t samples = 1;
-    (void)msaa_level;
+    // E6: WebGPU has 1x and 4x only; any MSAA request (2-8) becomes 4x.
+    static int sFbTraced = 0;
+    if (sFbTraced < 8) {
+        ++sFbTraced;
+        AuroraTrace("[lus-aurora] framebuffer %d: %ux%u, MSAA %u, depth %d", fb_id, width, height, msaa_level,
+                    has_depth_buffer ? 1 : 0);
+    }
+    const uint32_t samples = msaa_level > 1 ? 4 : 1;
     if (f.width == width && f.height == height && f.samples == samples && f.hasDepth == has_depth_buffer &&
         f.color) {
         return;
@@ -997,6 +1031,18 @@ void GfxRenderingAPIAurora::UpdateFramebufferParameters(int fb_id, uint32_t widt
                wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
     f.color = mDevice.CreateTexture(&td);
     f.colorView = f.color.CreateView();
+    f.msaaColor = nullptr;
+    f.msaaView = nullptr;
+    if (samples > 1) {
+        wgpu::TextureDescriptor md{};
+        md.label = "Fast3D framebuffer (MSAA)";
+        md.size = { width, height, 1 };
+        md.format = wgpu::TextureFormat::RGBA8Unorm;
+        md.usage = wgpu::TextureUsage::RenderAttachment;
+        md.sampleCount = samples;
+        f.msaaColor = mDevice.CreateTexture(&md);
+        f.msaaView = f.msaaColor.CreateView();
+    }
     f.depth = nullptr;
     f.depthView = nullptr;
     if (has_depth_buffer) {
@@ -1005,6 +1051,7 @@ void GfxRenderingAPIAurora::UpdateFramebufferParameters(int fb_id, uint32_t widt
         dd.size = { width, height, 1 };
         dd.format = wgpu::TextureFormat::Depth32Float;
         dd.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
+        dd.sampleCount = samples;
         f.depth = mDevice.CreateTexture(&dd);
         f.depthView = f.depth.CreateView();
     }
@@ -1189,13 +1236,14 @@ GfxRenderingAPIAurora::GetPixelDepth(int fb_id, const std::set<std::pair<float, 
     e[2].binding = 2;
     e[2].buffer = outBuf;
     wgpu::BindGroupDescriptor bgd{};
-    bgd.layout = mDepthPipeline.GetBindGroupLayout(0);
+    const wgpu::ComputePipeline& depthPipeline = f.samples > 1 ? mDepthPipelineMs : mDepthPipeline;
+    bgd.layout = depthPipeline.GetBindGroupLayout(0);
     bgd.entryCount = 3;
     bgd.entries = e;
     auto bg = mDevice.CreateBindGroup(&bgd);
     auto cmd = mDevice.CreateCommandEncoder();
     auto pass = cmd.BeginComputePass();
-    pass.SetPipeline(mDepthPipeline);
+    pass.SetPipeline(depthPipeline);
     pass.SetBindGroup(0, bg);
     pass.DispatchWorkgroups(static_cast<uint32_t>(n));
     pass.End();
@@ -1332,7 +1380,11 @@ void GfxRenderingAPIAurora::ReplayOps(const wgpu::Device& device, const wgpu::Co
             continue;
         }
         wgpu::RenderPassColorAttachment ca{};
-        ca.view = op.colorView;
+        ca.view = op.msaaView ? op.msaaView : op.colorView;
+        if (op.msaaView) {
+            // Resolved at the end of every pass, so copies, reads and ImGui see the image.
+            ca.resolveTarget = op.colorView;
+        }
         ca.loadOp = op.clearColor ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
         ca.storeOp = wgpu::StoreOp::Store;
         ca.clearValue = { op.color[0], op.color[1], op.color[2], op.color[3] };
@@ -1666,6 +1718,7 @@ void GfxRenderingAPIAurora::SelfTestMapped() {
         [this, size](wgpu::MapAsyncStatus status, wgpu::StringView) {
             if (status != wgpu::MapAsyncStatus::Success) {
                 SPDLOG_ERROR("Aurora backend self-test: readback failed");
+                mSelfTestBusy = false;
                 return;
             }
             const auto* data = static_cast<const uint8_t*>(mSelfTestBuffer.GetConstMappedRange(0, size));
@@ -1685,9 +1738,12 @@ void GfxRenderingAPIAurora::SelfTestMapped() {
             mSelfTestBuffer.Unmap();
             const uint8_t* px = rgb.data() + (static_cast<size_t>(h / 2) * w + w / 2) * 3;
             const int r = px[0], g = px[1], b = px[2];
-            const bool wrote = WritePng("lus_aurora_frame.png", w, h, rgb);
-            AuroraTrace("[lus-aurora] self-test: frame %u (%ux%u) %s lus_aurora_frame.png", mSelfTestFrame, w, h,
-                        wrote ? "saved to" : "could NOT be saved to");
+            const std::string file =
+                mSelfTestShot == 0 ? "lus_aurora_frame.png" : "lus_aurora_frame_" + std::to_string(mSelfTestShot) + ".png";
+            const bool wrote = WritePng(file.c_str(), w, h, rgb);
+            AuroraTrace("[lus-aurora] self-test: frame %u (%ux%u) %s %s", mSelfTestFrame, w, h,
+                        wrote ? "saved to" : "could NOT be saved to", file.c_str());
+            mSelfTestBusy = false;
             SPDLOG_INFO("Aurora backend self-test: scene centre pixel at frame {} = {},{},{}", mSelfTestFrame, r, g,
                         b);
             AuroraTrace("[lus-aurora] self-test: scene centre pixel at frame %u = %d,%d,%d", mSelfTestFrame, r, g, b);

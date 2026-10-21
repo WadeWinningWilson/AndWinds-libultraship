@@ -14,6 +14,7 @@
 // resolves and readbacks come in later steps.
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <string>
@@ -164,9 +165,11 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
         uint32_t height = 0;
         uint32_t samples = 1;
         bool hasDepth = false;
-        wgpu::Texture color;
+        wgpu::Texture color;     // single-sample; with MSAA, the resolved image
         wgpu::TextureView colorView;
-        wgpu::Texture depth;
+        wgpu::Texture msaaColor; // 4x when the framebuffer asked for MSAA (E6), resolved into color
+        wgpu::TextureView msaaView;
+        wgpu::Texture depth;     // same sample count as the pass
         wgpu::TextureView depthView;
         // Used as a texture (SelectTextureFb), a framebuffer takes sampler state like one.
         bool linear = false;
@@ -214,6 +217,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
         uint32_t draws = 0;
         // Targets captured at record time, so the worker never reads mFramebuffers.
         wgpu::TextureView colorView;
+        wgpu::TextureView msaaView; // set: render here, resolve into colorView
         wgpu::TextureView depthView;
         std::vector<DrawOp> drawOps;
     };
@@ -264,7 +268,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     void BeginPass(int fb);
     void RetireResources();
     void CreateSharedObjects();
-    wgpu::RenderPipeline GetPipeline(ShaderProgramAurora* prg, bool hasDepth);
+    wgpu::RenderPipeline GetPipeline(ShaderProgramAurora* prg, bool hasDepth, uint32_t samples);
     wgpu::Sampler GetSampler(bool linear, uint32_t cms, uint32_t cmt);
     wgpu::BindGroup GetTextureBindGroup();
     void FlushUploads();
@@ -329,6 +333,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     uint64_t mImGuiLayoutKey = 0;
     // GetPixelDepth: a compute pass loads depth at the queried points (E4).
     wgpu::ComputePipeline mDepthPipeline;
+    wgpu::ComputePipeline mDepthPipelineMs; // multisampled depth: sample 0
     uint64_t mStatReads = 0;
     uint64_t mStatDepthReads = 0;
     wgpu::BindGroupLayout mUploadBgl;
@@ -359,6 +364,11 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     double mSelfTestAtTime = 0.0;
     double mStartTime = 0.0;
     bool mSelfTestTaken = false;
+    // LUS_AURORA_SELFTEST_BURST=<n>: after the first capture, n more, each as soon as the
+    // previous one is written, to lus_aurora_frame_<1..n>.png (short effects such as sword trails).
+    uint32_t mSelfTestBurst = 0;
+    uint32_t mSelfTestShot = 0;
+    std::atomic<bool> mSelfTestBusy{ false };
     // LUS_AURORA_READBACK_TEST=t<seconds>: at that time, ReadFramebufferToCPU(0, 320, 240)
     // mid-frame (exercising the flush path) and save it to lus_aurora_readback.png.
     double mReadbackTestAt = 0.0;
