@@ -23,6 +23,7 @@ enum WindowBackend {
     FAST3D_DXGI_DX11 = 1,
     FAST3D_SDL_OPENGL = 2,
     FAST3D_SDL_METAL = 3,
+    FAST3D_AURORA = 4, ///< Aurora (WebGPU through aurora_bridge.dll); only with ENABLE_AURORA
 };
 
 class Fast3dWindow : public Ship::Window {

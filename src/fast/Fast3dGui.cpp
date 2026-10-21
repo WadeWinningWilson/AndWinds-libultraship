@@ -51,6 +51,12 @@ void Fast3dGui::Init(GuiWindowInitData windowImpl) {
 }
 
 bool Fast3dGui::SupportsViewports() {
+#ifdef ENABLE_AURORA
+    // No ImGui platform backend on Aurora yet, so no OS windows for ImGui viewports.
+    if (mImpl.Backend == WindowBackend::FAST3D_AURORA) {
+        return false;
+    }
+#endif
 #ifdef __linux__
     const char* currentDesktop = std::getenv("XDG_CURRENT_DESKTOP");
     if (currentDesktop && std::string(currentDesktop) == "gamescope") {
@@ -168,6 +174,15 @@ void Fast3dGui::ImGuiBackendInit() {
                                 static_cast<ID3D11DeviceContext*>(mImpl.Dx11.DeviceContext));
             break;
 #endif
+#ifdef ENABLE_AURORA
+        case WindowBackend::FAST3D_AURORA: {
+            // ImGui is not drawn on Aurora yet; build the font atlas so frames run.
+            unsigned char* pixels = nullptr;
+            int w = 0, h = 0;
+            ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
+            break;
+        }
+#endif
         default:
             break;
     }
@@ -208,6 +223,16 @@ void Fast3dGui::ImGuiBackendNewFrame() {
             ImGui_ImplDX11_NewFrame();
             break;
 #endif
+#ifdef ENABLE_AURORA
+        case WindowBackend::FAST3D_AURORA:
+            // As a renderer backend's NewFrame does: rebuild the atlas after fonts were added.
+            if (!ImGui::GetIO().Fonts->IsBuilt()) {
+                unsigned char* pixels = nullptr;
+                int w = 0, h = 0;
+                ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
+            }
+            break;
+#endif
 
 #ifdef __APPLE__
         case WindowBackend::FAST3D_SDL_METAL: {
@@ -231,6 +256,15 @@ void Fast3dGui::ImGuiWMNewFrame() {
         case WindowBackend::FAST3D_DXGI_DX11:
             ImGui_ImplWin32_NewFrame();
             break;
+#endif
+#ifdef ENABLE_AURORA
+        case WindowBackend::FAST3D_AURORA: {
+            auto window = Ship::Context::GetRawInstance()->GetWindow();
+            ImGuiIO& io = ImGui::GetIO();
+            io.DisplaySize = ImVec2(static_cast<float>(window->GetWidth()), static_cast<float>(window->GetHeight()));
+            io.DeltaTime = 1.0f / 60.0f;
+            break;
+        }
 #endif
         default:
             break;

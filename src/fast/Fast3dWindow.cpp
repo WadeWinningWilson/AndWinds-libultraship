@@ -12,6 +12,7 @@
 #include "fast/backends/gfx_direct3d_common.h"
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
+#include "fast/backends/gfx_aurora.h"
 
 #include "fast/Fast3dGui.h"
 
@@ -37,6 +38,9 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
     }
 #endif
     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#ifdef ENABLE_AURORA
+    AddAvailableWindowBackend(WindowBackend::FAST3D_AURORA);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -153,6 +157,13 @@ void Fast3dWindow::InitWindowManager() {
         case WindowBackend::FAST3D_SDL_METAL:
             mRenderingApi = new GfxRenderingAPIMetal();
             mWindowManagerApi = new GfxWindowBackendSDL2();
+            break;
+#endif
+#ifdef ENABLE_AURORA
+        case WindowBackend::FAST3D_AURORA:
+            AuroraTrace("[lus-aurora] Fast3dWindow: Aurora backend selected");
+            mWindowManagerApi = new GfxWindowBackendAurora();
+            mRenderingApi = new GfxRenderingAPIAurora(static_cast<GfxWindowBackendAurora*>(mWindowManagerApi));
             break;
 #endif
         default:
@@ -401,6 +412,8 @@ std::string Fast3dWindow::GetWindowBackendName() {
             return "OpenGL";
         case WindowBackend::FAST3D_SDL_METAL:
             return "Metal";
+        case WindowBackend::FAST3D_AURORA:
+            return "Aurora";
         default:
             return "";
     }
