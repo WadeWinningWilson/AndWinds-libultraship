@@ -1,6 +1,7 @@
 #ifdef ENABLE_AURORA
 
 #include "fast/backends/gfx_aurora.h"
+#include "fast/backends/gfx_aurora_host.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +25,49 @@ namespace Fast {
 
 namespace {
 
+// aurora_bridge.dll: the standalone Aurora (the bridge is delay-loaded, so it is only touched when this table is used).
+const AuroraGfxHost kBridgeGfx = {
+    [] { return AuroraBridge::Gfx::Device(); },
+    [] { return AuroraBridge::Gfx::Queue(); },
+    [] { return AuroraBridge::Gfx::SceneLayout(); },
+    [] { return AuroraBridge::Gfx::UsesReversedZ(); },
+    [](const aurora::gfx::DrawTypeDescriptor& d) { return AuroraBridge::Gfx::RegisterDrawType(d); },
+    [](aurora::gfx::DrawTypeId t) { AuroraBridge::Gfx::UnregisterDrawType(t); },
+    [](aurora::gfx::DrawTypeId t, const void* p, size_t n) { return AuroraBridge::Gfx::PushCustomDraw(t, p, n); },
+    [](const aurora::gfx::EncoderTaskDescriptor& d) { return AuroraBridge::Gfx::RegisterEncoderTaskType(d); },
+    [](aurora::gfx::EncoderTaskId t) { AuroraBridge::Gfx::UnregisterEncoderTaskType(t); },
+    [](aurora::gfx::EncoderTaskId t, const void* p, size_t n) { return AuroraBridge::Gfx::PushEncoderTask(t, p, n); },
+    [](const uint8_t* d, size_t n, size_t a) { return AuroraBridge::Gfx::PushVerts(d, n, a); },
+    [](const uint8_t* d, size_t n, size_t a) { return AuroraBridge::Gfx::PushIndices(d, n, a); },
+    [](const uint8_t* d, size_t n) { return AuroraBridge::Gfx::PushUniform(d, n); },
+    [](const uint8_t* d, size_t n) { return AuroraBridge::Gfx::PushStorage(d, n); },
+    [](const aurora::gfx::ResolveDesc& d, aurora::gfx::ResolvedTargets& o) { return AuroraBridge::Gfx::ResolvePass(d, o); },
+    [] { AuroraBridge::Gfx::Synchronize(); },
+    [](float*, float*) { return false; }, // standalone: framebuffer 0 is the whole screen
+};
+
+AuroraGfxHost sHostGfx{};
+bool sHosted = false;
+
+} // namespace
+
+void SetAuroraGfxHost(const AuroraGfxHost* host) {
+    sHosted = host != nullptr;
+    if (sHosted) {
+        sHostGfx = *host;
+    }
+}
+
+bool AuroraGfxIsHosted() {
+    return sHosted;
+}
+
+const AuroraGfxHost& AuroraGfx() {
+    return sHosted ? sHostGfx : kBridgeGfx;
+}
+
+namespace {
+
 namespace gfx = aurora::gfx;
 
 bool WritePng(const char* path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgb);
@@ -37,6 +81,42 @@ struct VO { @builtin(position) p: vec4f, @location(0) uv: vec2f };
   var o: VO; o.p = vec4f(xy, 0.0, 1.0); o.uv = vec2f(xy.x * 0.5 + 0.5, 0.5 - xy.y * 0.5); return o;
 }
 @fragment fn fs(i: VO) -> @location(0) vec4f { return textureSample(t, s, i.uv); }
+)";
+
+// A hosted world's composite (ALBT&W HR10-Q4): framebuffer 0's colour, and its depth turned into the host camera's.
+// Fast3D's depth is (z/w + 1) / 2 of the game's OpenGL-style projection (GetClipParameters: z from 0 to 1), so with the
+// game's own near / far it gives back the distance along the view axis; that distance in host units goes through the
+// host projection's z and w rows. Cleared depth (the sky) is the host's far plane: the visitor is always in front.
+constexpr const char* WorldCompositeWgsl = R"(
+struct U { proj: vec4f, view: vec4f }; // proj: host z / w rows; view: near, far, world per host unit, reversed-Z
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+@group(0) @binding(2) var d: texture_depth_2d;
+@group(0) @binding(3) var<uniform> u: U;
+struct VO { @builtin(position) p: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
+  let xy = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+  var o: VO; o.p = vec4f(xy, 0.0, 1.0); o.uv = vec2f(xy.x * 0.5 + 0.5, 0.5 - xy.y * 0.5); return o;
+}
+struct FO { @location(0) c: vec4f, @builtin(frag_depth) z: f32 };
+@fragment fn fs(i: VO) -> FO {
+  var o: FO;
+  o.c = textureSample(t, s, i.uv);
+  let size = vec2i(textureDimensions(d));
+  let texel = clamp(vec2i(i.uv * vec2f(size)), vec2i(0), size - vec2i(1));
+  let dz = textureLoad(d, texel, 0);
+  let far = select(1.0, 0.0, u.view.w > 0.5);
+  if (dz >= 1.0) {
+    o.z = far;
+  } else {
+    let n = u.view.x;
+    let f = u.view.y;
+    let dist = 2.0 * f * n / ((f + n) - (dz * 2.0 - 1.0) * (f - n));
+    let zv = -dist / u.view.z;
+    o.z = clamp((u.proj.x * zv + u.proj.y) / (u.proj.z * zv + u.proj.w), 0.0, 1.0);
+  }
+  return o;
+}
 )";
 
 // Texture upload: words[0] = width, words[1] = height, then RGBA8 pixels.
@@ -99,6 +179,7 @@ struct ReplayPayload {
 struct CompositePayload {
     GfxRenderingAPIAurora* self;
     WGPUTextureView view;
+    WGPUTextureView depth; // framebuffer 0's depth, for a hosted world's composite (null: colour only)
 };
 
 struct ImGuiPayload {
@@ -136,7 +217,7 @@ void ReplayTrampoline(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEnc
 void CompositeTrampoline(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void* payload,
                          size_t, void*) {
     const auto& p = *static_cast<const CompositePayload*>(payload);
-    p.self->DrawComposite(ctx, pass, p.view);
+    p.self->DrawComposite(ctx, pass, p.view, p.depth);
 }
 
 void SelfTestTrampoline(const gfx::EncoderTaskContext&, const wgpu::CommandEncoder& cmd, const void* payload, size_t,
@@ -194,11 +275,11 @@ GfxRenderingAPIAurora::GfxRenderingAPIAurora(GfxWindowBackendAurora* window) : m
 
 GfxRenderingAPIAurora::~GfxRenderingAPIAurora() {
     if (mDevice) {
-        AuroraBridge::Gfx::Synchronize();
-        AuroraBridge::Gfx::UnregisterEncoderTaskType(mReplayTask);
-        AuroraBridge::Gfx::UnregisterDrawType(mCompositeDraw);
-        AuroraBridge::Gfx::UnregisterEncoderTaskType(mSelfTestTask);
-        AuroraBridge::Gfx::UnregisterDrawType(mImGuiDraw);
+        AuroraGfx().synchronize();
+        AuroraGfx().unregisterEncoderTaskType(mReplayTask);
+        AuroraGfx().unregisterDrawType(mCompositeDraw);
+        AuroraGfx().unregisterEncoderTaskType(mSelfTestTask);
+        AuroraGfx().unregisterDrawType(mImGuiDraw);
         if (mImGuiReady) {
             ImGui_ImplWGPU_Shutdown();
         }
@@ -427,6 +508,15 @@ void GfxRenderingAPIAurora::UploadTexture(const uint8_t* rgba32Buf, uint32_t wid
 
 void GfxRenderingAPIAurora::FlushUploads() {
     // Push pending pixels into Aurora's storage stream, within this frame's budget.
+    if (mHosted) {
+        // Hosted: the pixels go with the frame and are written at replay (ReplayFromCpu).
+        auto& hostedUps = mHostedUploads[mRecordingSlot];
+        while (!mPendingUploads.empty()) {
+            hostedUps.push_back(std::move(mPendingUploads.front()));
+            mPendingUploads.pop_front();
+        }
+        return;
+    }
     size_t budget = UploadBudgetPerFrame;
     auto& ups = mUploads[mRecordingSlot];
     while (!mPendingUploads.empty()) {
@@ -439,7 +529,7 @@ void GfxRenderingAPIAurora::FlushUploads() {
         op.storageView = p.storageView;
         op.width = p.width;
         op.height = p.height;
-        op.range = AuroraBridge::Gfx::PushStorage(reinterpret_cast<const uint8_t*>(p.words.data()), bytes);
+        op.range = AuroraGfx().pushStorage(reinterpret_cast<const uint8_t*>(p.words.data()), bytes);
         ups.push_back(std::move(op));
         budget -= std::min(budget, bytes);
         mPendingUploads.pop_front();
@@ -682,8 +772,13 @@ void GfxRenderingAPIAurora::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, s
     DrawOp d;
     d.pipeline = GetPipeline(mCurrentShader, static_cast<bool>(pass.depthView), fb.samples);
     d.textures = GetTextureBindGroup();
-    d.verts = AuroraBridge::Gfx::PushVerts(reinterpret_cast<const uint8_t*>(buf_vbo), buf_vbo_len * sizeof(float), 4);
-    d.uniformOffset = AuroraBridge::Gfx::PushUniform(reinterpret_cast<const uint8_t*>(&u), sizeof(u)).offset;
+    if (mHosted) {
+        // Placed in the frame's own buffers at replay (ReplayFromCpu).
+        d.verts.size = static_cast<uint32_t>(buf_vbo_len * sizeof(float));
+    } else {
+        d.verts = AuroraGfx().pushVerts(reinterpret_cast<const uint8_t*>(buf_vbo), buf_vbo_len * sizeof(float), 4);
+        d.uniformOffset = AuroraGfx().pushUniform(reinterpret_cast<const uint8_t*>(&u), sizeof(u)).offset;
+    }
     d.vertsCpu.assign(buf_vbo, buf_vbo + buf_vbo_len);
     std::memcpy(d.uniformsCpu.data(), &u, sizeof(u));
     d.vertexCount = static_cast<uint32_t>(buf_vbo_num_tris * 3);
@@ -784,18 +879,19 @@ void GfxRenderingAPIAurora::Init() {
     AuroraTrace("[lus-aurora] rendering: init");
     AuroraTrace("[lus-aurora] cvar %s = %d", CVAR_MSAA_VALUE,
                 Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_MSAA_VALUE, -1));
-    mDevice = AuroraBridge::Gfx::Device();
+    mDevice = AuroraGfx().device();
+    mHosted = AuroraGfxIsHosted();
     if (!mDevice) {
         SPDLOG_ERROR("Aurora backend: no WebGPU device");
         return;
     }
     CreateSharedObjects();
-    mReplayTask = AuroraBridge::Gfx::RegisterEncoderTaskType(
+    mReplayTask = AuroraGfx().registerEncoderTaskType(
         { .label = "Fast3D frame", .callback = ReplayTrampoline, .userdata = this });
     mCompositeDraw =
-        AuroraBridge::Gfx::RegisterDrawType({ .label = "Fast3D composite", .draw = CompositeTrampoline, .userdata = this });
-    mImGuiDraw = AuroraBridge::Gfx::RegisterDrawType({ .label = "libultraship ImGui", .draw = ImGuiTrampoline, .userdata = this });
-    mSelfTestTask = AuroraBridge::Gfx::RegisterEncoderTaskType({ .label = "Fast3D self-test",
+        AuroraGfx().registerDrawType({ .label = "Fast3D composite", .draw = CompositeTrampoline, .userdata = this });
+    mImGuiDraw = AuroraGfx().registerDrawType({ .label = "libultraship ImGui", .draw = ImGuiTrampoline, .userdata = this });
+    mSelfTestTask = AuroraGfx().registerEncoderTaskType({ .label = "Fast3D self-test",
                                                                  .callback = SelfTestTrampoline,
                                                                  .userdata = this,
                                                                  .afterSubmit = SelfTestAfterSubmit });
@@ -870,6 +966,7 @@ void GfxRenderingAPIAurora::StartFrame() {
     mRecordingSlot = mFrameCounter % FrameSlots;
     mFrames[mRecordingSlot].clear();
     mUploads[mRecordingSlot].clear();
+    mHostedUploads[mRecordingSlot].clear();
     mImGuiThisFrame[mRecordingSlot] = false;
     ++mFrameCountUniform;
     RetireResources();
@@ -924,15 +1021,17 @@ void GfxRenderingAPIAurora::EndFrame() {
                     static_cast<unsigned long long>(mStatSkippedDraws));
     }
     const ReplayPayload rp{ this, mRecordingSlot };
-    AuroraBridge::Gfx::PushEncoderTask(mReplayTask, &rp, sizeof(rp));
+    AuroraGfx().pushEncoderTask(mReplayTask, &rp, sizeof(rp));
     mCompositeViews[mRecordingSlot] = mFramebuffers[0].colorView;
     if (mCompositeViews[mRecordingSlot]) {
-        const CompositePayload cp{ this, mCompositeViews[mRecordingSlot].Get() };
-        AuroraBridge::Gfx::PushCustomDraw(mCompositeDraw, &cp, sizeof(cp));
+        const Framebuffer& fb0 = mFramebuffers[0];
+        const CompositePayload cp{ this, mCompositeViews[mRecordingSlot].Get(),
+                                   mHosted && fb0.samples == 1 && fb0.depthView ? fb0.depthView.Get() : nullptr };
+        AuroraGfx().pushCustomDraw(mCompositeDraw, &cp, sizeof(cp));
     }
     if (mImGuiThisFrame[mRecordingSlot] && mImGuiFrames[mRecordingSlot] != nullptr) {
         const ImGuiPayload ip{ this, mRecordingSlot };
-        AuroraBridge::Gfx::PushCustomDraw(mImGuiDraw, &ip, sizeof(ip));
+        AuroraGfx().pushCustomDraw(mImGuiDraw, &ip, sizeof(ip));
     }
 
     const bool selfTestNow = mSelfTestAtTime > 0.0
@@ -947,7 +1046,7 @@ void GfxRenderingAPIAurora::EndFrame() {
         mSelfTestTaken = true;
         mSelfTestFrame = static_cast<uint32_t>(mStatFrames);
         gfx::ResolvedTargets snap{};
-        if (AuroraBridge::Gfx::ResolvePass({ .color = true }, snap) && snap.colorTexture) {
+        if (AuroraGfx().resolvePass({ .color = true }, snap) && snap.colorTexture) {
             mSelfTestTexture = snap.colorTexture;
             mSelfTestFormat = snap.colorFormat;
             // The whole on-screen frame: written to lus_aurora_frame.png when mapped.
@@ -959,7 +1058,7 @@ void GfxRenderingAPIAurora::EndFrame() {
             bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
             mSelfTestBuffer = mDevice.CreateBuffer(&bd);
             const SelfTestPayload sp{ this, mSelfTestTexture.Get() };
-            AuroraBridge::Gfx::PushEncoderTask(mSelfTestTask, &sp, sizeof(sp));
+            AuroraGfx().pushEncoderTask(mSelfTestTask, &sp, sizeof(sp));
         } else {
             mSelfTestBusy = false;
         }
@@ -1133,6 +1232,10 @@ void GfxRenderingAPIAurora::ReadFramebufferToCPU(int fbId, uint32_t width, uint3
     if (!mDevice || fbId < 0 || fbId >= static_cast<int>(mFramebuffers.size()) || width == 0 || height == 0) {
         return;
     }
+    if (mHosted) {
+        // Hosted: the queue belongs to the host's frame; a mid-frame read waits for a host-side readback (M2 plan).
+        return;
+    }
     // E2: what this frame drew so far must be on the GPU before reading it.
     ExecuteRecordedNow();
     const Framebuffer& f = mFramebuffers[fbId];
@@ -1195,6 +1298,13 @@ GfxRenderingAPIAurora::GetPixelDepth(int fb_id, const std::set<std::pair<float, 
         res.emplace(c, 0);
     }
     if (!mDevice || coordinates.empty() || fb_id < 0 || fb_id >= static_cast<int>(mFramebuffers.size())) {
+        return res;
+    }
+    if (mHosted) {
+        // Hosted: as ReadFramebufferToCPU; answer "nothing in front" (the far value, as MM's sky reads).
+        for (auto& [c, d] : res) {
+            d = 0xFFFC;
+        }
         return res;
     }
     // E4: MM asks before this frame's Run, so this is the last completed frame's
@@ -1322,6 +1432,10 @@ void GfxRenderingAPIAurora::SelectTextureFb(int fbId) {
 
 void GfxRenderingAPIAurora::ReplayFrame(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd,
                                         uint32_t slot) {
+    if (mHosted) {
+        ReplayFromCpu(ctx.device, ctx.queue, cmd, mHostedUploads[slot], mFrames[slot]);
+        return;
+    }
     // The uniform bind group for Aurora's uniform buffer (one per buffer object).
     auto ubIt = mUniformBindGroups.find(ctx.uniformBuffer.Get());
     if (ubIt == mUniformBindGroups.end()) {
@@ -1428,7 +1542,7 @@ bool GfxRenderingAPIAurora::WaitForMap(const wgpu::Buffer& buffer, uint64_t size
 
 void GfxRenderingAPIAurora::ExecuteRecordedNow() {
     // E2/E3: the worker must be drained before the game thread uses the queue.
-    AuroraBridge::Gfx::Synchronize();
+    AuroraGfx().synchronize();
     if (!mRecording) {
         return; // nothing recorded this frame: earlier frames are already submitted
     }
@@ -1436,10 +1550,24 @@ void GfxRenderingAPIAurora::ExecuteRecordedNow() {
     if (ops.empty() && mPendingUploads.empty()) {
         return;
     }
+    std::vector<PendingUpload> ups(std::make_move_iterator(mPendingUploads.begin()),
+                                   std::make_move_iterator(mPendingUploads.end()));
+    auto cmd = mDevice.CreateCommandEncoder();
+    ReplayFromCpu(mDevice, mDevice.GetQueue(), cmd, ups, ops);
+    auto cb = cmd.Finish();
+    mDevice.GetQueue().Submit(1, &cb);
+    // Executed: the rest of the frame continues on what is now in the textures.
+    ops.clear();
+    mPendingUploads.clear();
+}
+
+void GfxRenderingAPIAurora::ReplayFromCpu(const wgpu::Device& device, const wgpu::Queue& queue,
+                                          const wgpu::CommandEncoder& cmd, const std::vector<PendingUpload>& pending,
+                                          std::vector<PassOp>& ops) {
     auto align = [](std::vector<uint8_t>& v, size_t a) { v.resize((v.size() + a - 1) / a * a); };
     std::vector<uint8_t> sdata, vdata, udata;
     std::vector<UploadOp> ups;
-    for (const PendingUpload& p : mPendingUploads) {
+    for (const PendingUpload& p : pending) {
         align(sdata, 256);
         UploadOp op;
         op.storageView = p.storageView;
@@ -1468,11 +1596,11 @@ void GfxRenderingAPIAurora::ExecuteRecordedNow() {
         bd.label = label;
         bd.size = std::max<uint64_t>(256, (data.size() + 3) / 4 * 4);
         bd.usage = usage | wgpu::BufferUsage::CopyDst;
-        auto buf = mDevice.CreateBuffer(&bd);
+        auto buf = device.CreateBuffer(&bd);
         if (!data.empty()) {
             std::vector<uint8_t> padded(data);
             padded.resize((data.size() + 3) / 4 * 4);
-            mDevice.GetQueue().WriteBuffer(buf, 0, padded.data(), padded.size());
+            queue.WriteBuffer(buf, 0, padded.data(), padded.size());
         }
         return buf;
     };
@@ -1488,19 +1616,116 @@ void GfxRenderingAPIAurora::ExecuteRecordedNow() {
     ubd.layout = mUniformBgl;
     ubd.entryCount = 1;
     ubd.entries = &ue;
-    auto ubg = mDevice.CreateBindGroup(&ubd);
+    auto ubg = device.CreateBindGroup(&ubd);
 
-    auto cmd = mDevice.CreateCommandEncoder();
-    ReplayOps(mDevice, cmd, ups, ops, sbuf, vbuf, ubg);
-    auto cb = cmd.Finish();
-    mDevice.GetQueue().Submit(1, &cb);
-    // Executed: the rest of the frame continues on what is now in the textures.
-    ops.clear();
-    mPendingUploads.clear();
+    ReplayOps(device, cmd, ups, ops, sbuf, vbuf, ubg);
+}
+
+bool GfxRenderingAPIAurora::DrawWorldComposite(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
+                                               WGPUTextureView view, WGPUTextureView depthView) {
+    float projZ[4], worldScale = 1.0f, zNear = 0.0f, zFar = 0.0f;
+    if (!AuroraGfx().worldDepth(projZ, &worldScale) || !AuroraWorldDepthRange(&zNear, &zFar) || worldScale <= 0.0f ||
+        ctx.layout.depthStencilFormat == wgpu::TextureFormat::Undefined) {
+        return false;
+    }
+    if (!mWorldPipeline || mWorldLayoutKey != ctx.layout.key) {
+        if (!mWorldBgl) {
+            wgpu::BindGroupLayoutEntry e[4]{};
+            e[0].binding = 0;
+            e[0].visibility = wgpu::ShaderStage::Fragment;
+            e[0].texture.sampleType = wgpu::TextureSampleType::Float;
+            e[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+            e[1].binding = 1;
+            e[1].visibility = wgpu::ShaderStage::Fragment;
+            e[1].sampler.type = wgpu::SamplerBindingType::Filtering;
+            e[2].binding = 2;
+            e[2].visibility = wgpu::ShaderStage::Fragment;
+            e[2].texture.sampleType = wgpu::TextureSampleType::Depth;
+            e[2].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+            e[3].binding = 3;
+            e[3].visibility = wgpu::ShaderStage::Fragment;
+            e[3].buffer.type = wgpu::BufferBindingType::Uniform;
+            e[3].buffer.minBindingSize = 32;
+            wgpu::BindGroupLayoutDescriptor bld{};
+            bld.entryCount = 4;
+            bld.entries = e;
+            mWorldBgl = ctx.device.CreateBindGroupLayout(&bld);
+            wgpu::BufferDescriptor bd{};
+            bd.label = "Fast3D world composite";
+            bd.size = 256;
+            bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+            mWorldUniforms = ctx.device.CreateBuffer(&bd);
+            if (!mCompositeSampler) {
+                wgpu::SamplerDescriptor sd{};
+                sd.magFilter = wgpu::FilterMode::Linear;
+                sd.minFilter = wgpu::FilterMode::Linear;
+                mCompositeSampler = ctx.device.CreateSampler(&sd);
+            }
+        }
+        auto module = MakeModule(ctx.device, WorldCompositeWgsl, "Fast3D world composite");
+        wgpu::ColorTargetState cts[gfx::MaxColorAttachments]{};
+        for (uint32_t i = 0; i < ctx.layout.colorAttachmentCount; ++i) {
+            cts[i].format = ctx.layout.colorAttachments[i].format;
+            cts[i].writeMask =
+                i == gfx::SceneColorAttachmentIndex ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None;
+        }
+        wgpu::FragmentState fs{};
+        fs.module = module;
+        fs.entryPoint = "fs";
+        fs.targetCount = ctx.layout.colorAttachmentCount;
+        fs.targets = cts;
+        wgpu::DepthStencilState ds{};
+        ds.format = ctx.layout.depthStencilFormat;
+        ds.depthWriteEnabled = true; // the world writes the depth the visitor is tested against
+        ds.depthCompare = wgpu::CompareFunction::Always;
+        wgpu::PipelineLayoutDescriptor pld{};
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts = &mWorldBgl;
+        wgpu::RenderPipelineDescriptor pd{};
+        pd.label = "Fast3D world composite";
+        pd.layout = ctx.device.CreatePipelineLayout(&pld);
+        pd.vertex.module = module;
+        pd.vertex.entryPoint = "vs";
+        pd.fragment = &fs;
+        pd.depthStencil = &ds;
+        pd.multisample.count = ctx.layout.sampleCount;
+        mWorldPipeline = ctx.device.CreateRenderPipeline(&pd);
+        mWorldLayoutKey = ctx.layout.key;
+    }
+    // proj (host z / w rows along the view axis), then near, far, world units per host unit, reversed-Z.
+    const float u[8] = { projZ[0], projZ[1], projZ[2], projZ[3],
+                         zNear,    zFar,     worldScale, AuroraGfx().usesReversedZ() ? 1.0f : 0.0f };
+    ctx.queue.WriteBuffer(mWorldUniforms, 0, u, sizeof(u));
+    if (view != mWorldBoundView || depthView != mWorldBoundDepth || !mWorldBg) {
+        wgpu::BindGroupEntry be[4]{};
+        be[0].binding = 0;
+        be[0].textureView = wgpu::TextureView(view);
+        be[1].binding = 1;
+        be[1].sampler = mCompositeSampler;
+        be[2].binding = 2;
+        be[2].textureView = wgpu::TextureView(depthView);
+        be[3].binding = 3;
+        be[3].buffer = mWorldUniforms;
+        be[3].size = 32;
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = mWorldBgl;
+        bgd.entryCount = 4;
+        bgd.entries = be;
+        mWorldBg = ctx.device.CreateBindGroup(&bgd);
+        mWorldBoundView = view;
+        mWorldBoundDepth = depthView;
+    }
+    pass.SetPipeline(mWorldPipeline);
+    pass.SetBindGroup(0, mWorldBg);
+    pass.Draw(3);
+    return true;
 }
 
 void GfxRenderingAPIAurora::DrawComposite(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
-                                          WGPUTextureView view) {
+                                          WGPUTextureView view, WGPUTextureView depthView) {
+    if (depthView != nullptr && DrawWorldComposite(ctx, pass, view, depthView)) {
+        return;
+    }
     if (!mCompositePipeline || mCompositeLayoutKey != ctx.layout.key) {
         if (!mCompositeBgl) {
             wgpu::BindGroupLayoutEntry e[2]{};
@@ -1572,11 +1797,11 @@ void GfxRenderingAPIAurora::RenderImGui(ImDrawData* data) {
     if (!mRecording || data == nullptr || !data->Valid || data->CmdListsCount == 0) {
         return;
     }
-    const gfx::RenderTargetLayout layout = AuroraBridge::Gfx::SceneLayout();
+    const gfx::RenderTargetLayout layout = AuroraGfx().sceneLayout();
     const bool fontsChanged = ImGui::GetIO().Fonts->TexID == static_cast<ImTextureID>(nullptr);
     if (!mImGuiReady || layout.key != mImGuiLayoutKey || fontsChanged) {
         // E3: the renderer creates and uploads its font texture through the queue.
-        AuroraBridge::Gfx::Synchronize();
+        AuroraGfx().synchronize();
         if (mImGuiReady) {
             ImGui_ImplWGPU_Shutdown();
         }

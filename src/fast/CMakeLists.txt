@@ -59,12 +59,24 @@ if (LUS_AURORA_BRIDGE_DIR)
     target_compile_definitions(libultraship PRIVATE ENABLE_AURORA IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
     # ImGui's stock WebGPU renderer, against libultraship's own ImGui.
     target_sources(libultraship PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp)
-    target_link_libraries(libultraship PUBLIC "${LUS_AURORA_BRIDGE_DIR}/lib/aurora_bridge.lib"
-                                              "${LUS_AURORA_BRIDGE_DIR}/lib/webgpu_dawn.lib")
+    # LUS_AURORA_HOST_PROCS: libultraship runs inside a host built on Aurora (ALBT&W) and draws with the host's own
+    # WebGPU. Every wgpu* function is a stub filled from the host (backends/aurora/wgpu_host_procs.c, generated from
+    # the same Dawn headers) instead of a second Dawn from webgpu_dawn.dll.
+    option(LUS_AURORA_HOST_PROCS "Take WebGPU from the hosting process (Aurora host) instead of webgpu_dawn.dll" OFF)
+    target_link_libraries(libultraship PUBLIC "${LUS_AURORA_BRIDGE_DIR}/lib/aurora_bridge.lib")
+    if (LUS_AURORA_HOST_PROCS)
+        target_sources(libultraship PRIVATE backends/aurora/wgpu_host_procs.c)
+        target_compile_definitions(libultraship PRIVATE LUS_AURORA_HOST_PROCS)
+    else()
+        target_link_libraries(libultraship PUBLIC "${LUS_AURORA_BRIDGE_DIR}/lib/webgpu_dawn.lib")
+    endif()
     if (MSVC)
         # Load the bridge only when the Aurora backend is chosen, so the other
         # backends still start when its DLLs are absent.
-        target_link_options(libultraship INTERFACE "/DELAYLOAD:aurora_bridge.dll" "/DELAYLOAD:webgpu_dawn.dll")
+        target_link_options(libultraship INTERFACE "/DELAYLOAD:aurora_bridge.dll")
+        if (NOT LUS_AURORA_HOST_PROCS)
+            target_link_options(libultraship INTERFACE "/DELAYLOAD:webgpu_dawn.dll")
+        endif()
         target_link_libraries(libultraship PUBLIC delayimp.lib)
     endif()
     file(GLOB LUS_AURORA_RUNTIME_DLLS "${LUS_AURORA_BRIDGE_DIR}/bin/*.dll")

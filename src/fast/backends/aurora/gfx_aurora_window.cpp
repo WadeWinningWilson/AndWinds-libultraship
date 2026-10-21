@@ -1,6 +1,7 @@
 #ifdef ENABLE_AURORA
 
 #include "fast/backends/gfx_aurora.h"
+#include "fast/backends/gfx_aurora_host.h"
 #include "ship/Context.h"
 
 #include <cstdarg>
@@ -255,6 +256,19 @@ AuroraBridge::Backend BackendFromEnv() {
 void GfxWindowBackendAurora::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
                                   uint32_t height, int32_t posX, int32_t posY) {
     InstallCrashTrace();
+    if (AuroraGfxIsHosted()) {
+        // Hosted in an Aurora host: no window of our own. The frame is the host's scene target; input comes from the
+        // host through the frontend (ControlDeck host pads, Gui host gamepad); the host paces frames.
+        mHosted = true;
+        mInitialized = true;
+        mFullScreen = startFullScreen;
+        mWidth = width;
+        mHeight = height;
+        RefreshHostedSize();
+        AuroraTrace("[lus-aurora] window: hosted in an Aurora host, frame %ux%u", mWidth, mHeight);
+        SPDLOG_INFO("Aurora backend: hosted, frame {}x{}", mWidth, mHeight);
+        return;
+    }
     AuroraBridge::Config config;
     config.appName = gameName;
     config.width = width;
@@ -308,7 +322,9 @@ void GfxWindowBackendAurora::SetFullscreen(bool fullscreen) {
     if (fullscreen == mFullScreen) {
         return;
     }
-    AuroraBridge::SetFullscreen(fullscreen);
+    if (!mHosted) {
+        AuroraBridge::SetFullscreen(fullscreen);
+    }
     mFullScreen = fullscreen;
     if (mOnFullscreenChanged != nullptr) {
         mOnFullscreenChanged(fullscreen);
@@ -316,10 +332,13 @@ void GfxWindowBackendAurora::SetFullscreen(bool fullscreen) {
 }
 
 void GfxWindowBackendAurora::GetActiveWindowRefreshRate(uint32_t* refreshRate) {
-    *refreshRate = AuroraBridge::GetRefreshRate();
+    *refreshRate = mHosted ? 60 : AuroraBridge::GetRefreshRate();
 }
 
 void GfxWindowBackendAurora::SetCursorVisibility(bool visible) {
+    if (mHosted) {
+        return; // the host's cursor
+    }
     AuroraBridge::SetCursorVisible(visible);
 }
 
@@ -327,6 +346,11 @@ void GfxWindowBackendAurora::SetMousePos(int32_t, int32_t) {
 }
 
 void GfxWindowBackendAurora::GetMousePos(int32_t* x, int32_t* y) {
+    if (mHosted) {
+        *x = 0;
+        *y = 0;
+        return;
+    }
     AuroraBridge::GetMousePos(x, y);
 }
 
@@ -359,6 +383,10 @@ void GfxWindowBackendAurora::GetDimensions(uint32_t* width, uint32_t* height, in
 }
 
 void GfxWindowBackendAurora::SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) {
+    if (mHosted) {
+        RefreshHostedSize(); // the host's scene target decides
+        return;
+    }
     AuroraBridge::SetWindowSize(width, height, posX, posY);
     AuroraBridge::GetWindowSize(&mWidth, &mHeight, &mPosX, &mPosY);
 }
@@ -369,6 +397,10 @@ Ship::WindowRect GfxWindowBackendAurora::GetPrimaryMonitorRect() {
 
 void GfxWindowBackendAurora::HandleEvents() {
     if (!mInitialized) {
+        return;
+    }
+    if (mHosted) {
+        RefreshHostedSize();
         return;
     }
     AuroraBridge::Event events[64];
@@ -467,7 +499,7 @@ bool GfxWindowBackendAurora::BeginFrameIfNeeded() {
         return false;
     }
     if (!mFrameOpen) {
-        mFrameOpen = AuroraBridge::BeginFrame();
+        mFrameOpen = mHosted ? true : AuroraBridge::BeginFrame();
     }
     return mFrameOpen;
 }
@@ -477,11 +509,11 @@ void GfxWindowBackendAurora::WaitForNextFrame() {
     // backend: a coarse wait, then a short spin for the last 1.5 ms. Aurora's
     // present adds vsync on top when enabled.
     if (Ship::Context::HostPacesFrames() || mTargetFps <= 0) {
-        mPreviousPresentTime = AuroraBridge::GetTime();
+        mPreviousPresentTime = GetTime();
         return;
     }
     const double next = mPreviousPresentTime + 1.0 / static_cast<double>(mTargetFps);
-    double now = AuroraBridge::GetTime();
+    double now = GetTime();
     const double coarse = next - now - 0.0015;
     if (coarse > 0) {
 #ifdef _WIN32
@@ -500,7 +532,7 @@ void GfxWindowBackendAurora::WaitForNextFrame() {
 #endif
     }
     do {
-        now = AuroraBridge::GetTime();
+        now = GetTime();
     } while (now < next);
     // A frame that ran long starts the schedule again rather than racing to catch up.
     mPreviousPresentTime = (now - next > 1.0 / static_cast<double>(mTargetFps)) ? now : next;
@@ -509,7 +541,9 @@ void GfxWindowBackendAurora::WaitForNextFrame() {
 void GfxWindowBackendAurora::SwapBuffersBegin() {
     if (mFrameOpen) {
         WaitForNextFrame();
-        AuroraBridge::EndFrame();
+        if (!mHosted) {
+            AuroraBridge::EndFrame();
+        }
         mFrameOpen = false;
     }
 }
@@ -518,6 +552,10 @@ void GfxWindowBackendAurora::SwapBuffersEnd() {
 }
 
 double GfxWindowBackendAurora::GetTime() {
+    if (mHosted) {
+        static const auto sStart = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - sStart).count();
+    }
     return AuroraBridge::GetTime();
 }
 
@@ -546,7 +584,9 @@ bool GfxWindowBackendAurora::IsRunning() {
 
 void GfxWindowBackendAurora::Destroy() {
     if (mInitialized) {
-        AuroraBridge::Shutdown();
+        if (!mHosted) {
+            AuroraBridge::Shutdown();
+        }
         mInitialized = false;
     }
 #ifdef _WIN32
@@ -555,6 +595,16 @@ void GfxWindowBackendAurora::Destroy() {
         mTimer = nullptr;
     }
 #endif
+}
+
+void GfxWindowBackendAurora::RefreshHostedSize() {
+    const aurora::gfx::RenderTargetLayout layout = AuroraGfx().sceneLayout();
+    if (layout.colorAttachmentCount > 0 && layout.colorAttachments[0].width > 0 && layout.colorAttachments[0].height > 0) {
+        mWidth = layout.colorAttachments[0].width;
+        mHeight = layout.colorAttachments[0].height;
+    }
+    mPosX = 0;
+    mPosY = 0;
 }
 
 bool GfxWindowBackendAurora::IsFullscreen() {

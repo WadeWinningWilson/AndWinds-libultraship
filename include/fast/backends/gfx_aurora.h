@@ -85,6 +85,9 @@ class GfxWindowBackendAurora final : public GfxWindowBackend {
 
   private:
     bool mInitialized = false;
+    // Hosted in an Aurora host (AuroraGfxIsHosted): no window of its own; the host's scene target is the frame.
+    bool mHosted = false;
+    void RefreshHostedSize();
     bool mFrameOpen = false;
     uint32_t mWidth = 0;
     uint32_t mHeight = 0;
@@ -152,7 +155,10 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     // Render-worker callbacks (Aurora encoder task and custom draw).
     void ReplayFrame(const aurora::gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, uint32_t slot);
     void DrawComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
-                       WGPUTextureView view);
+                       WGPUTextureView view, WGPUTextureView depthView = nullptr);
+    // Hosted world (ALBT&W HR10-Q4): framebuffer 0 composited with its depth turned into the host camera's.
+    bool DrawWorldComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
+                            WGPUTextureView view, WGPUTextureView depthView);
     void SelfTestCopy(const wgpu::CommandEncoder& cmd, WGPUTexture texture);
     // libultraship's ImGui: copied on the game thread (Fast3dGui::ImGuiRenderDrawData),
     // drawn by imgui_impl_wgpu into Aurora's scene pass after the game composite.
@@ -261,7 +267,9 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     };
 
   private:
-    static constexpr uint32_t FrameSlots = 3; // Aurora keeps 2 frames in flight; one more for recording.
+    // Aurora keeps 2 frames in flight, one more for recording, and one for a hosted push that a host issues on
+    // its own thread up to a frame later (gfx_aurora_host_c.h).
+    static constexpr uint32_t FrameSlots = 4;
     static constexpr uint32_t TextureSlots = 6; // tex0, tex1, mask0, mask1, blend0, blend1
     static constexpr size_t UploadBudgetPerFrame = 6u << 20; // of Aurora's 8 MiB storage stream
 
@@ -280,6 +288,10 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     // gfx::synchronize(), through the backend's own encoder and buffers) and
     // drops it from the frame. For mid-frame reads (E2).
     void ExecuteRecordedNow();
+    // Records ups and ops into cmd from their CPU copies, through buffers made here (written with queue):
+    // ExecuteRecordedNow's path, and every frame when hosted (the host's streaming buffers are not used then).
+    void ReplayFromCpu(const wgpu::Device& device, const wgpu::Queue& queue, const wgpu::CommandEncoder& cmd,
+                       const std::vector<PendingUpload>& ups, std::vector<PassOp>& ops);
     bool WaitForMap(const wgpu::Buffer& buffer, uint64_t size);
 
     GfxWindowBackendAurora* mWindow;
@@ -292,6 +304,9 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     int mCurrentFb = 0;
     std::array<std::vector<PassOp>, FrameSlots> mFrames;
     std::array<std::vector<UploadOp>, FrameSlots> mUploads;
+    // Hosted (AuroraGfxIsHosted): uploads kept with their pixels for ReplayFromCpu.
+    std::array<std::vector<PendingUpload>, FrameSlots> mHostedUploads;
+    bool mHosted = false;
     // Framebuffer 0's view per slot: holds the reference the composite draw samples.
     std::array<wgpu::TextureView, FrameSlots> mCompositeViews;
     uint32_t mFrameCounter = 0;
@@ -354,6 +369,13 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     wgpu::Sampler mCompositeSampler;
     WGPUTextureView mCompositeBoundView = nullptr;
     wgpu::BindGroup mCompositeBg;
+    wgpu::RenderPipeline mWorldPipeline;
+    uint64_t mWorldLayoutKey = ~0ull;
+    wgpu::BindGroupLayout mWorldBgl;
+    wgpu::Buffer mWorldUniforms;
+    wgpu::BindGroup mWorldBg;
+    WGPUTextureView mWorldBoundView = nullptr;
+    WGPUTextureView mWorldBoundDepth = nullptr;
 
     // Diagnostics: LUS_AURORA_DEBUG_CLEAR=r,g,b (0-255) overrides framebuffer 0's
     // clear colour; LUS_AURORA_SELFTEST=<frame> logs the scene's centre pixel then;

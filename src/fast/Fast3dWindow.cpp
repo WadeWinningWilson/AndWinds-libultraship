@@ -13,6 +13,7 @@
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_aurora.h"
+#include "fast/backends/gfx_aurora_host.h"
 
 #include "fast/Fast3dGui.h"
 
@@ -182,7 +183,12 @@ uint16_t Fast3dWindow::GetPixelDepth(float x, float y) {
 }
 
 void Fast3dWindow::InitWindowManager() {
+#ifdef ENABLE_AURORA
+    // Hosted in an Aurora host (a host gfx table installed): draw with the host's Aurora.
+    SetWindowBackend(AuroraGfxIsHosted() ? static_cast<int32_t>(WindowBackend::FAST3D_AURORA) : GetSavedWindowBackend());
+#else
     SetWindowBackend(GetSavedWindowBackend());
+#endif
 
     switch (GetWindowBackend()) {
 #ifdef ENABLE_DX11

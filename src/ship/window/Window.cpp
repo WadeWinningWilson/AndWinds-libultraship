@@ -125,6 +125,10 @@ std::shared_ptr<MouseStateManager> Window::GetMouseStateManager() {
 
 void Window::SetWindowBackend(int32_t backend) {
     mWindowBackend = backend;
+    if (Context::IsEmbeddedInHost()) {
+        // Embedded: the config is the standalone game's (as with window geometry); a host's choice is not saved.
+        return;
+    }
     mConfig->SetInt("Window.Backend.Id", GetWindowBackend());
     mConfig->SetString("Window.Backend.Name", GetWindowBackendName());
     mConfig->Save();
