@@ -15,6 +15,7 @@
 #include <csignal>
 #include <exception>
 
+#include <imgui.h>
 #include <spdlog/spdlog.h>
 
 #ifdef _WIN32
@@ -142,6 +143,96 @@ int LusScancode(int raw) {
     (void)raw;
     return 0;
 #endif
+}
+
+// SDL scancodes (USB HID usage IDs, the same in SDL2 and SDL3) to ImGui keys,
+// for libultraship's ImGui (its platform backend is SDL2/Win32 elsewhere).
+ImGuiKey ImGuiKeyFromSdl(int sc) {
+    if (sc >= 4 && sc <= 29) return static_cast<ImGuiKey>(ImGuiKey_A + (sc - 4));
+    if (sc >= 30 && sc <= 38) return static_cast<ImGuiKey>(ImGuiKey_1 + (sc - 30));
+    if (sc == 39) return ImGuiKey_0;
+    if (sc >= 58 && sc <= 69) return static_cast<ImGuiKey>(ImGuiKey_F1 + (sc - 58));
+    if (sc >= 89 && sc <= 97) return static_cast<ImGuiKey>(ImGuiKey_Keypad1 + (sc - 89));
+    switch (sc) {
+        case 40: return ImGuiKey_Enter;
+        case 41: return ImGuiKey_Escape;
+        case 42: return ImGuiKey_Backspace;
+        case 43: return ImGuiKey_Tab;
+        case 44: return ImGuiKey_Space;
+        case 45: return ImGuiKey_Minus;
+        case 46: return ImGuiKey_Equal;
+        case 47: return ImGuiKey_LeftBracket;
+        case 48: return ImGuiKey_RightBracket;
+        case 49: return ImGuiKey_Backslash;
+        case 51: return ImGuiKey_Semicolon;
+        case 52: return ImGuiKey_Apostrophe;
+        case 53: return ImGuiKey_GraveAccent;
+        case 54: return ImGuiKey_Comma;
+        case 55: return ImGuiKey_Period;
+        case 56: return ImGuiKey_Slash;
+        case 57: return ImGuiKey_CapsLock;
+        case 70: return ImGuiKey_PrintScreen;
+        case 71: return ImGuiKey_ScrollLock;
+        case 72: return ImGuiKey_Pause;
+        case 73: return ImGuiKey_Insert;
+        case 74: return ImGuiKey_Home;
+        case 75: return ImGuiKey_PageUp;
+        case 76: return ImGuiKey_Delete;
+        case 77: return ImGuiKey_End;
+        case 78: return ImGuiKey_PageDown;
+        case 79: return ImGuiKey_RightArrow;
+        case 80: return ImGuiKey_LeftArrow;
+        case 81: return ImGuiKey_DownArrow;
+        case 82: return ImGuiKey_UpArrow;
+        case 83: return ImGuiKey_NumLock;
+        case 84: return ImGuiKey_KeypadDivide;
+        case 85: return ImGuiKey_KeypadMultiply;
+        case 86: return ImGuiKey_KeypadSubtract;
+        case 87: return ImGuiKey_KeypadAdd;
+        case 88: return ImGuiKey_KeypadEnter;
+        case 98: return ImGuiKey_Keypad0;
+        case 99: return ImGuiKey_KeypadDecimal;
+        case 224: return ImGuiKey_LeftCtrl;
+        case 225: return ImGuiKey_LeftShift;
+        case 226: return ImGuiKey_LeftAlt;
+        case 227: return ImGuiKey_LeftSuper;
+        case 228: return ImGuiKey_RightCtrl;
+        case 229: return ImGuiKey_RightShift;
+        case 230: return ImGuiKey_RightAlt;
+        case 231: return ImGuiKey_RightSuper;
+        default: return ImGuiKey_None;
+    }
+}
+
+void ImGuiKeyEvent(int sdlScancode, bool down) {
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    const ImGuiKey key = ImGuiKeyFromSdl(sdlScancode);
+    switch (key) {
+        case ImGuiKey_LeftCtrl:
+        case ImGuiKey_RightCtrl:
+            io.AddKeyEvent(ImGuiMod_Ctrl, down);
+            break;
+        case ImGuiKey_LeftShift:
+        case ImGuiKey_RightShift:
+            io.AddKeyEvent(ImGuiMod_Shift, down);
+            break;
+        case ImGuiKey_LeftAlt:
+        case ImGuiKey_RightAlt:
+            io.AddKeyEvent(ImGuiMod_Alt, down);
+            break;
+        case ImGuiKey_LeftSuper:
+        case ImGuiKey_RightSuper:
+            io.AddKeyEvent(ImGuiMod_Super, down);
+            break;
+        default:
+            break;
+    }
+    if (key != ImGuiKey_None) {
+        io.AddKeyEvent(key, down);
+    }
 }
 
 // LUS_AURORA_BACKEND=d3d12|vulkan|d3d11|opengl picks Aurora's GPU API (default: Aurora's choice).
@@ -297,15 +388,41 @@ void GfxWindowBackendAurora::HandleEvents() {
                 AuroraBridge::GetWindowSize(&mWidth, &mHeight, &mPosX, &mPosY);
                 break;
             case AuroraBridge::Event::Type::MouseDown:
-                if (ev.a >= 0 && ev.a < 32) mMouseButtons |= 1u << ev.a;
-                if (mOnMouseButtonDown != nullptr) mOnMouseButtonDown(ev.a - 1);
+            case AuroraBridge::Event::Type::MouseUp: {
+                const bool down = ev.type == AuroraBridge::Event::Type::MouseDown;
+                if (ev.a >= 0 && ev.a < 32) {
+                    mMouseButtons = down ? (mMouseButtons | (1u << ev.a)) : (mMouseButtons & ~(1u << ev.a));
+                }
+                if (ImGui::GetCurrentContext() != nullptr && ev.a >= 1 && ev.a <= 5) {
+                    // ImGui buttons: 0 left, 1 right, 2 middle.
+                    const int imguiButton = ev.a == 1 ? 0 : (ev.a == 3 ? 1 : (ev.a == 2 ? 2 : ev.a - 1));
+                    ImGui::GetIO().AddMouseButtonEvent(imguiButton, down);
+                }
+                if (down && mOnMouseButtonDown != nullptr) mOnMouseButtonDown(ev.a - 1);
+                if (!down && mOnMouseButtonUp != nullptr) mOnMouseButtonUp(ev.a - 1);
                 break;
-            case AuroraBridge::Event::Type::MouseUp:
-                if (ev.a >= 0 && ev.a < 32) mMouseButtons &= ~(1u << ev.a);
-                if (mOnMouseButtonUp != nullptr) mOnMouseButtonUp(ev.a - 1);
+            }
+            case AuroraBridge::Event::Type::MouseMove:
+                if (ImGui::GetCurrentContext() != nullptr) {
+                    ImGui::GetIO().AddMousePosEvent(static_cast<float>(ev.a), static_cast<float>(ev.b));
+                }
+                break;
+            case AuroraBridge::Event::Type::MouseWheel:
+                if (ImGui::GetCurrentContext() != nullptr) {
+                    ImGui::GetIO().AddMouseWheelEvent(ev.a / 120.0f, ev.b / 120.0f);
+                }
+                break;
+            case AuroraBridge::Event::Type::Text:
+                if (ImGui::GetCurrentContext() != nullptr) {
+                    ImGui::GetIO().AddInputCharacter(static_cast<unsigned int>(ev.a));
+                }
                 break;
             case AuroraBridge::Event::Type::FocusLost:
-                if (mOnAllKeysUp != nullptr) mOnAllKeysUp();
+            case AuroraBridge::Event::Type::FocusGained:
+                if (ImGui::GetCurrentContext() != nullptr) {
+                    ImGui::GetIO().AddFocusEvent(ev.type == AuroraBridge::Event::Type::FocusGained);
+                }
+                if (ev.type == AuroraBridge::Event::Type::FocusLost && mOnAllKeysUp != nullptr) mOnAllKeysUp();
                 break;
             case AuroraBridge::Event::Type::KeyDown:
             case AuroraBridge::Event::Type::KeyUp: {
@@ -317,6 +434,7 @@ void GfxWindowBackendAurora::HandleEvents() {
                     AuroraTrace("[lus-aurora] key %s: SDL %d, raw 0x%x -> libultraship 0x%x", down ? "down" : "up",
                                 ev.a, ev.b, key);
                 }
+                ImGuiKeyEvent(ev.a, down);
                 if (key != 0) {
                     if (down && mOnKeyDown != nullptr) mOnKeyDown(key);
                     if (!down && mOnKeyUp != nullptr) mOnKeyUp(key);

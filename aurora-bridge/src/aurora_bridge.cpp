@@ -56,6 +56,10 @@ bool Initialize(const Config& config, Info& info) {
     ac.mem2Size = 0;
     const AuroraInfo ai = aurora_initialize(0, nullptr, &ac);
     sWindow = ai.window;
+    if (sWindow != nullptr) {
+        // Text events for libultraship's ImGui (SDL3 delivers them only when enabled).
+        SDL_StartTextInput(sWindow);
+    }
     sBackend = static_cast<Backend>(ai.backend);
     info.backend = sBackend;
     info.width = ai.windowSize.width;
@@ -113,6 +117,39 @@ int Poll(Event* events, int max) {
                     case SDL_EVENT_WINDOW_FOCUS_GAINED:
                         out.type = Event::Type::FocusGained;
                         break;
+                    case SDL_EVENT_MOUSE_MOTION: {
+                        // SDL3 reports window coordinates; libultraship's sizes are pixels.
+                        const float d = sWindow != nullptr ? SDL_GetWindowPixelDensity(sWindow) : 1.0f;
+                        out.type = Event::Type::MouseMove;
+                        out.a = static_cast<int32_t>(ev->sdl.motion.x * d);
+                        out.b = static_cast<int32_t>(ev->sdl.motion.y * d);
+                        break;
+                    }
+                    case SDL_EVENT_MOUSE_WHEEL:
+                        out.type = Event::Type::MouseWheel;
+                        out.a = static_cast<int32_t>(ev->sdl.wheel.x * 120.0f);
+                        out.b = static_cast<int32_t>(ev->sdl.wheel.y * 120.0f);
+                        break;
+                    case SDL_EVENT_TEXT_INPUT: {
+                        // UTF-8 -> one event per code point.
+                        const auto* p = reinterpret_cast<const unsigned char*>(ev->sdl.text.text);
+                        while (p != nullptr && *p != 0 && n < max) {
+                            uint32_t cp = *p;
+                            int extra = 0;
+                            if (cp >= 0xF0) { cp &= 0x07; extra = 3; }
+                            else if (cp >= 0xE0) { cp &= 0x0F; extra = 2; }
+                            else if (cp >= 0xC0) { cp &= 0x1F; extra = 1; }
+                            ++p;
+                            for (int k = 0; k < extra && *p != 0; ++k, ++p) {
+                                cp = (cp << 6) | (*p & 0x3F);
+                            }
+                            Event t{};
+                            t.type = Event::Type::Text;
+                            t.a = static_cast<int32_t>(cp);
+                            events[n++] = t;
+                        }
+                        break;
+                    }
                     default:
                         break;
                 }

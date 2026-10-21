@@ -27,6 +27,7 @@
 #include "fast/backends/gfx_window_manager_api.h"
 
 struct CCFeatures;
+struct ImDrawData;
 
 namespace Fast {
 
@@ -152,6 +153,10 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     void DrawComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
                        WGPUTextureView view);
     void SelfTestCopy(const wgpu::CommandEncoder& cmd, WGPUTexture texture);
+    // libultraship's ImGui: copied on the game thread (Fast3dGui::ImGuiRenderDrawData),
+    // drawn by imgui_impl_wgpu into Aurora's scene pass after the game composite.
+    void RenderImGui(ImDrawData* data);
+    void DrawImGui(const wgpu::RenderPassEncoder& pass, uint32_t slot);
     void SelfTestMapped();
 
     struct Framebuffer {
@@ -163,6 +168,14 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
         wgpu::TextureView colorView;
         wgpu::Texture depth;
         wgpu::TextureView depthView;
+        // Used as a texture (SelectTextureFb), a framebuffer takes sampler state like one.
+        bool linear = false;
+        uint32_t cms = 0;
+        uint32_t cmt = 0;
+        int filtering = FILTER_LINEAR;
+        // Copy of this framebuffer for sampling it while it is the open target.
+        wgpu::Texture snapshot;
+        wgpu::TextureView snapshotView;
     };
 
     // One recorded draw: everything the worker needs, captured at record time.
@@ -174,11 +187,27 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
         uint32_t vertexCount = 0;
         std::array<float, 4> viewport{}; // x, y, w, h (top-left origin, clamped to the target)
         std::array<uint32_t, 4> scissor{}; // x, y, w, h (clamped to the target)
+        // CPU copies, for replaying mid-frame through the backend's own buffers
+        // (ReadFramebufferToCPU): Aurora's streams reach the GPU only at end of frame.
+        std::vector<float> vertsCpu;
+        std::array<uint8_t, 80> uniformsCpu{};
     };
 
     // One recorded pass on a backend-owned framebuffer.
+    // One recorded op: a pass on a backend-owned framebuffer, or (fb == -1) a copy
+    // between framebuffers, which WebGPU only allows outside a pass.
+    struct CopyOp {
+        wgpu::Texture src;
+        wgpu::Texture dst;
+        std::array<uint32_t, 2> srcOrigin{};
+        std::array<uint32_t, 2> dstOrigin{};
+        std::array<uint32_t, 2> size{};
+    };
+
     struct PassOp {
         int fb = 0;
+        bool isCopy = false;
+        CopyOp copy;
         bool clearColor = false;
         bool clearDepth = false;
         std::array<float, 4> color{ 0.0f, 0.0f, 0.0f, 1.0f };
@@ -239,6 +268,15 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     wgpu::Sampler GetSampler(bool linear, uint32_t cms, uint32_t cmt);
     wgpu::BindGroup GetTextureBindGroup();
     void FlushUploads();
+    // Records into cmd: uploads (from storageBuffer ranges), then passes and copies.
+    void ReplayOps(const wgpu::Device& device, const wgpu::CommandEncoder& cmd, const std::vector<UploadOp>& ups,
+                   const std::vector<PassOp>& ops, const wgpu::Buffer& storageBuffer, const wgpu::Buffer& vertexBuffer,
+                   const wgpu::BindGroup& uniforms);
+    // Executes everything recorded so far this frame on the GPU now (after
+    // gfx::synchronize(), through the backend's own encoder and buffers) and
+    // drops it from the frame. For mid-frame reads (E2).
+    void ExecuteRecordedNow();
+    bool WaitForMap(const wgpu::Buffer& buffer, uint64_t size);
 
     GfxWindowBackendAurora* mWindow;
     wgpu::Device mDevice;
@@ -272,6 +310,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     std::vector<TextureAurora> mTextures;
     std::array<uint32_t, TextureSlots> mSlotTextures{};
     std::array<wgpu::TextureView, TextureSlots> mSlotFbViews; // SelectTextureFb overrides a slot
+    std::array<int, TextureSlots> mSlotFbIds{};                 // ... with this framebuffer (-1: none)
     int mCurrentTile = 0;
     std::map<uint32_t, wgpu::Sampler> mSamplers;
     std::map<std::array<void*, TextureSlots + 2>, std::pair<wgpu::BindGroup, uint32_t>> mTextureBindGroups;
@@ -282,6 +321,16 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
 
     // Upload compute pipeline (worker uses it).
     wgpu::ComputePipeline mUploadPipeline;
+    wgpu::Instance mInstance;
+    aurora::gfx::DrawTypeId mImGuiDraw = aurora::gfx::InvalidDrawType;
+    std::array<ImDrawData*, FrameSlots> mImGuiFrames{};
+    std::array<bool, FrameSlots> mImGuiThisFrame{};
+    bool mImGuiReady = false;
+    uint64_t mImGuiLayoutKey = 0;
+    // GetPixelDepth: a compute pass loads depth at the queried points (E4).
+    wgpu::ComputePipeline mDepthPipeline;
+    uint64_t mStatReads = 0;
+    uint64_t mStatDepthReads = 0;
     wgpu::BindGroupLayout mUploadBgl;
 
     // Per-draw state.
@@ -307,6 +356,13 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     bool mDebugClear = false;
     std::array<float, 4> mDebugClearColor{ 0.0f, 0.0f, 0.0f, 1.0f };
     uint32_t mSelfTestFrame = 0;
+    double mSelfTestAtTime = 0.0;
+    double mStartTime = 0.0;
+    bool mSelfTestTaken = false;
+    // LUS_AURORA_READBACK_TEST=t<seconds>: at that time, ReadFramebufferToCPU(0, 320, 240)
+    // mid-frame (exercising the flush path) and save it to lus_aurora_readback.png.
+    double mReadbackTestAt = 0.0;
+    bool mReadbackTestDone = false;
     wgpu::Buffer mSelfTestBuffer;
     wgpu::Texture mSelfTestTexture;
     wgpu::TextureFormat mSelfTestFormat = wgpu::TextureFormat::Undefined;
@@ -322,6 +378,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     uint64_t mStatUploads = 0;
     uint64_t mStatShaders = 0;
     uint64_t mStatSkippedDraws = 0;
+    uint64_t mStatCopies = 0;
     double mStatLastLog = 0;
 };
 

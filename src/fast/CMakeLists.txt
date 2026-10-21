@@ -56,7 +56,9 @@ if (LUS_AURORA_BRIDGE_DIR)
     source_group("graphic/aurora" FILES ${Source_Files__Graphic__Aurora})
     target_sources(libultraship PRIVATE ${Source_Files__Graphic__Aurora})
     target_include_directories(libultraship PRIVATE "${LUS_AURORA_BRIDGE_DIR}/include")
-    target_compile_definitions(libultraship PRIVATE ENABLE_AURORA)
+    target_compile_definitions(libultraship PRIVATE ENABLE_AURORA IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+    # ImGui's stock WebGPU renderer, against libultraship's own ImGui.
+    target_sources(libultraship PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp)
     target_link_libraries(libultraship PUBLIC "${LUS_AURORA_BRIDGE_DIR}/lib/aurora_bridge.lib"
                                               "${LUS_AURORA_BRIDGE_DIR}/lib/webgpu_dawn.lib")
     if (MSVC)

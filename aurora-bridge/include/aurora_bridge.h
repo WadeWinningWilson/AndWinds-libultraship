@@ -62,6 +62,9 @@ struct Event {
         MouseUp,     // a = button
         FocusLost,
         FocusGained,
+        MouseMove,   // a = x, b = y (pixels)
+        MouseWheel,  // a = x * 120, b = y * 120
+        Text,        // a = Unicode code point (one event per character)
     };
     Type type = Type::None;
     int32_t a = 0;

@@ -10,6 +10,10 @@
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/resource/File.h"
 
+#ifdef ENABLE_AURORA
+#include "fast/backends/gfx_aurora.h"
+#endif
+
 #ifdef __APPLE__
 #include <SDL_hints.h>
 #include <SDL_video.h>
@@ -230,6 +234,8 @@ void Fast3dGui::ImGuiBackendNewFrame() {
                 unsigned char* pixels = nullptr;
                 int w = 0, h = 0;
                 ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
+                // The renderer re-creates its font texture when the id is cleared.
+                ImGui::GetIO().Fonts->SetTexID(static_cast<ImTextureID>(nullptr));
             }
             break;
 #endif
@@ -300,6 +306,11 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
             ImGui_ImplDX11_RenderDrawData(data);
+            break;
+#endif
+#ifdef ENABLE_AURORA
+        case WindowBackend::FAST3D_AURORA:
+            static_cast<GfxRenderingAPIAurora*>(mInterpreter.lock()->GetCurrentRenderingAPI())->RenderImGui(data);
             break;
 #endif
         default:

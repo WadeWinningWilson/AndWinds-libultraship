@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <fstream>
 
+#include <imgui.h>
+#include <imgui_impl_wgpu.h>
 #include <spdlog/spdlog.h>
 
 #include "fast/Fast3dGui.h"
@@ -23,6 +25,8 @@ namespace Fast {
 namespace {
 
 namespace gfx = aurora::gfx;
+
+bool WritePng(const char* path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgb);
 
 constexpr const char* CompositeWgsl = R"(
 @group(0) @binding(0) var t: texture_2d<f32>;
@@ -45,6 +49,19 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let h = src[1];
   if (id.x >= w || id.y >= h) { return; }
   textureStore(dst, vec2i(id.xy), unpack4x8unorm(src[2u + id.y * w + id.x]));
+}
+)";
+
+// GetPixelDepth: depth at each queried point (Y already flipped), as the D3D11 backend's compute shader.
+constexpr const char* DepthReadWgsl = R"(
+@group(0) @binding(0) var depthTex: texture_depth_2d;
+@group(0) @binding(1) var<storage, read> coords: array<vec2i>;
+@group(0) @binding(2) var<storage, read_write> values: array<f32>;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let size = vec2i(textureDimensions(depthTex));
+  let c = clamp(coords[id.x], vec2i(0), size - vec2i(1));
+  values[id.x] = textureLoad(depthTex, c, 0);
 }
 )";
 
@@ -71,6 +88,27 @@ struct CompositePayload {
     GfxRenderingAPIAurora* self;
     WGPUTextureView view;
 };
+
+struct ImGuiPayload {
+    GfxRenderingAPIAurora* self;
+    uint32_t slot;
+};
+
+void ImGuiTrampoline(const gfx::DrawContext&, const wgpu::RenderPassEncoder& pass, const void* payload, size_t,
+                     void*) {
+    const auto& p = *static_cast<const ImGuiPayload*>(payload);
+    p.self->DrawImGui(pass, p.slot);
+}
+
+void FreeDrawData(ImDrawData*& d) {
+    if (d != nullptr) {
+        for (ImDrawList* l : d->CmdLists) {
+            IM_DELETE(l);
+        }
+        IM_DELETE(d);
+        d = nullptr;
+    }
+}
 
 struct SelfTestPayload {
     GfxRenderingAPIAurora* self;
@@ -148,6 +186,13 @@ GfxRenderingAPIAurora::~GfxRenderingAPIAurora() {
         AuroraBridge::Gfx::UnregisterEncoderTaskType(mReplayTask);
         AuroraBridge::Gfx::UnregisterDrawType(mCompositeDraw);
         AuroraBridge::Gfx::UnregisterEncoderTaskType(mSelfTestTask);
+        AuroraBridge::Gfx::UnregisterDrawType(mImGuiDraw);
+        if (mImGuiReady) {
+            ImGui_ImplWGPU_Shutdown();
+        }
+    }
+    for (auto& d : mImGuiFrames) {
+        FreeDrawData(d);
     }
 }
 
@@ -327,6 +372,7 @@ void GfxRenderingAPIAurora::SelectTexture(int tile, uint32_t textureId) {
     }
     mSlotTextures[tile] = textureId;
     mSlotFbViews[tile] = nullptr;
+    mSlotFbIds[tile] = -1;
     mCurrentTile = tile;
 }
 
@@ -391,6 +437,14 @@ void GfxRenderingAPIAurora::SetSamplerParameters(int tile, bool linear_filter, u
     if (tile < 0 || tile >= static_cast<int>(TextureSlots)) {
         return;
     }
+    if (mSlotFbIds[tile] >= 0) {
+        Framebuffer& f = mFramebuffers[mSlotFbIds[tile]];
+        f.linear = linear_filter;
+        f.cms = cms;
+        f.cmt = cmt;
+        f.filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
+        return;
+    }
     const uint32_t id = mSlotTextures[tile];
     if (id >= mTextures.size()) {
         return;
@@ -435,7 +489,10 @@ wgpu::BindGroup GfxRenderingAPIAurora::GetTextureBindGroup() {
     std::array<wgpu::Sampler, 2> samplers;
     for (uint32_t i = 0; i < 2; ++i) {
         const uint32_t id = mSlotTextures[i];
-        if (id < mTextures.size()) {
+        if (mSlotFbIds[i] >= 0) {
+            const Framebuffer& f = mFramebuffers[mSlotFbIds[i]];
+            samplers[i] = GetSampler(f.linear, f.cms, f.cmt);
+        } else if (id < mTextures.size()) {
             const TextureAurora& t = mTextures[id];
             samplers[i] = GetSampler(t.linear, t.cms, t.cmt);
         } else {
@@ -494,8 +551,12 @@ void GfxRenderingAPIAurora::SetSrgbMode() {
     mSrgbMode = true;
 }
 
-ImTextureID GfxRenderingAPIAurora::GetTextureById(int) {
-    return 0;
+ImTextureID GfxRenderingAPIAurora::GetTextureById(int id) {
+    // imgui_impl_wgpu takes a WGPUTextureView as ImTextureID.
+    if (id < 0 || id >= static_cast<int>(mTextures.size())) {
+        return static_cast<ImTextureID>(nullptr);
+    }
+    return reinterpret_cast<ImTextureID>(mTextures[id].view.Get());
 }
 
 // --- state ----------------------------------------------------------------------
@@ -590,7 +651,12 @@ void GfxRenderingAPIAurora::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, s
     u.viewport[3] = (ch - 2.0f * (vy - cy) - vh) / ch;
     for (int i = 0; i < 2; ++i) {
         const uint32_t id = mSlotTextures[i];
-        if (id < mTextures.size()) {
+        if (mSlotFbIds[i] >= 0) {
+            const Framebuffer& f = mFramebuffers[mSlotFbIds[i]];
+            u.texSize[i * 2] = static_cast<float>(std::max(1u, f.width));
+            u.texSize[i * 2 + 1] = static_cast<float>(std::max(1u, f.height));
+            u.texFilter[i] = f.filtering;
+        } else if (id < mTextures.size()) {
             u.texSize[i * 2] = static_cast<float>(std::max(1u, mTextures[id].width));
             u.texSize[i * 2 + 1] = static_cast<float>(std::max(1u, mTextures[id].height));
             u.texFilter[i] = mTextures[id].filtering;
@@ -605,6 +671,8 @@ void GfxRenderingAPIAurora::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, s
     d.textures = GetTextureBindGroup();
     d.verts = AuroraBridge::Gfx::PushVerts(reinterpret_cast<const uint8_t*>(buf_vbo), buf_vbo_len * sizeof(float), 4);
     d.uniformOffset = AuroraBridge::Gfx::PushUniform(reinterpret_cast<const uint8_t*>(&u), sizeof(u)).offset;
+    d.vertsCpu.assign(buf_vbo, buf_vbo + buf_vbo_len);
+    std::memcpy(d.uniformsCpu.data(), &u, sizeof(u));
     d.vertexCount = static_cast<uint32_t>(buf_vbo_num_tris * 3);
     d.viewport = { cx, cy, cw, ch };
     d.scissor = { static_cast<uint32_t>(sx0), static_cast<uint32_t>(sy0), static_cast<uint32_t>(sx1 - sx0),
@@ -686,6 +754,14 @@ void GfxRenderingAPIAurora::CreateSharedObjects() {
     mUploadPipeline = mDevice.CreateComputePipeline(&cpd);
 
     mSlotTextures.fill(0xFFFFFFFFu);
+    mSlotFbIds.fill(-1);
+
+    wgpu::ComputePipelineDescriptor dpd{};
+    dpd.label = "Fast3D depth read";
+    dpd.compute.module = MakeModule(mDevice, DepthReadWgsl, "Fast3D depth read");
+    dpd.compute.entryPoint = "main";
+    mDepthPipeline = mDevice.CreateComputePipeline(&dpd);
+    mInstance = mDevice.GetAdapter().GetInstance();
 }
 
 void GfxRenderingAPIAurora::Init() {
@@ -700,6 +776,7 @@ void GfxRenderingAPIAurora::Init() {
         { .label = "Fast3D frame", .callback = ReplayTrampoline, .userdata = this });
     mCompositeDraw =
         AuroraBridge::Gfx::RegisterDrawType({ .label = "Fast3D composite", .draw = CompositeTrampoline, .userdata = this });
+    mImGuiDraw = AuroraBridge::Gfx::RegisterDrawType({ .label = "libultraship ImGui", .draw = ImGuiTrampoline, .userdata = this });
     mSelfTestTask = AuroraBridge::Gfx::RegisterEncoderTaskType({ .label = "Fast3D self-test",
                                                                  .callback = SelfTestTrampoline,
                                                                  .userdata = this,
@@ -713,12 +790,26 @@ void GfxRenderingAPIAurora::Init() {
         }
     }
     if (const char* v = std::getenv("LUS_AURORA_SELFTEST")) {
-        mSelfTestFrame = static_cast<uint32_t>(std::atoi(v));
+        // "<frame>" or "t<seconds>" (time since the backend started).
+        if (v[0] == 't') {
+            mSelfTestAtTime = std::atof(v + 1);
+            mSelfTestFrame = 0xFFFFFFFFu;
+        } else {
+            mSelfTestFrame = static_cast<uint32_t>(std::atoi(v));
+        }
+        mStartTime = mWindow->GetTime();
         wgpu::BufferDescriptor bd{};
         bd.label = "Fast3D self-test readback";
         bd.size = 256;
         bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
         mSelfTestBuffer = mDevice.CreateBuffer(&bd);
+    }
+
+    if (const char* v = std::getenv("LUS_AURORA_READBACK_TEST")) {
+        mReadbackTestAt = std::atof(v[0] == 't' ? v + 1 : v);
+    }
+    if (mStartTime == 0.0) {
+        mStartTime = mWindow->GetTime();
     }
 
     uint32_t w = 0, h = 0;
@@ -758,6 +849,7 @@ void GfxRenderingAPIAurora::StartFrame() {
     mRecordingSlot = mFrameCounter % FrameSlots;
     mFrames[mRecordingSlot].clear();
     mUploads[mRecordingSlot].clear();
+    mImGuiThisFrame[mRecordingSlot] = false;
     ++mFrameCountUniform;
     RetireResources();
 }
@@ -783,6 +875,20 @@ void GfxRenderingAPIAurora::EndFrame() {
         return;
     }
     ++mStatFrames;
+    if (mReadbackTestAt > 0.0 && !mReadbackTestDone && mWindow->GetTime() - mStartTime >= mReadbackTestAt) {
+        mReadbackTestDone = true;
+        std::vector<uint16_t> px(320 * 240);
+        ReadFramebufferToCPU(0, 320, 240, px.data());
+        std::vector<uint8_t> rgb(320 * 240 * 3);
+        for (size_t i = 0; i < px.size(); ++i) {
+            rgb[i * 3 + 0] = static_cast<uint8_t>(((px[i] >> 11) & 31) * 255 / 31);
+            rgb[i * 3 + 1] = static_cast<uint8_t>(((px[i] >> 6) & 31) * 255 / 31);
+            rgb[i * 3 + 2] = static_cast<uint8_t>(((px[i] >> 1) & 31) * 255 / 31);
+        }
+        const bool wrote = WritePng("lus_aurora_readback.png", 320, 240, rgb);
+        AuroraTrace("[lus-aurora] readback test: frame %llu, ReadFramebufferToCPU(0, 320x240) mid-frame %s lus_aurora_readback.png",
+                    static_cast<unsigned long long>(mStatFrames), wrote ? "saved to" : "could NOT be saved to");
+    }
     FlushUploads();
     if (mStatFrames == 1 || mStatFrames == 60 || mStatFrames == 600) {
         size_t drawOps = 0;
@@ -802,8 +908,17 @@ void GfxRenderingAPIAurora::EndFrame() {
         const CompositePayload cp{ this, mCompositeViews[mRecordingSlot].Get() };
         AuroraBridge::Gfx::PushCustomDraw(mCompositeDraw, &cp, sizeof(cp));
     }
+    if (mImGuiThisFrame[mRecordingSlot] && mImGuiFrames[mRecordingSlot] != nullptr) {
+        const ImGuiPayload ip{ this, mRecordingSlot };
+        AuroraBridge::Gfx::PushCustomDraw(mImGuiDraw, &ip, sizeof(ip));
+    }
 
-    if (mSelfTestFrame != 0 && mStatFrames == mSelfTestFrame) {
+    const bool selfTestNow = mSelfTestAtTime > 0.0
+                                 ? (!mSelfTestTaken && mWindow->GetTime() - mStartTime >= mSelfTestAtTime)
+                                 : (mSelfTestFrame != 0 && mStatFrames == mSelfTestFrame);
+    if (selfTestNow) {
+        mSelfTestTaken = true;
+        mSelfTestFrame = static_cast<uint32_t>(mStatFrames);
         gfx::ResolvedTargets snap{};
         if (AuroraBridge::Gfx::ResolvePass({ .color = true }, snap) && snap.colorTexture) {
             mSelfTestTexture = snap.colorTexture;
@@ -824,9 +939,9 @@ void GfxRenderingAPIAurora::EndFrame() {
     const double now = mWindow->GetTime();
     if (now - mStatLastLog >= 1.0) {
         SPDLOG_INFO("Aurora backend: {} frames, {} passes, {} clears, {} draws ({} tris, {} skipped), {} shaders, "
-                    "{} uploads",
+                    "{} uploads, {} copies, {} framebuffer reads, {} depth reads",
                     mStatFrames, mStatPasses, mStatClears, mStatDraws, mStatTris, mStatSkippedDraws, mStatShaders,
-                    mStatUploads);
+                    mStatUploads, mStatCopies, mStatReads, mStatDepthReads);
         mStatLastLog = now;
     }
     ++mFrameCounter;
@@ -903,7 +1018,43 @@ void GfxRenderingAPIAurora::StartDrawToFramebuffer(int fbId, float noiseScale) {
     BeginPass(fbId);
 }
 
-void GfxRenderingAPIAurora::CopyFramebuffer(int, int, int, int, int, int, int, int, int, int) {
+void GfxRenderingAPIAurora::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1,
+                                            int dstX0, int dstY0, int dstX1, int dstY1) {
+    if (!mRecording || fbSrcId < 0 || fbDstId < 0 || fbSrcId >= static_cast<int>(mFramebuffers.size()) ||
+        fbDstId >= static_cast<int>(mFramebuffers.size()) || fbSrcId == fbDstId) {
+        return;
+    }
+    const Framebuffer& src = mFramebuffers[fbSrcId];
+    const Framebuffer& dst = mFramebuffers[fbDstId];
+    if (!src.color || !dst.color) {
+        return;
+    }
+    PassOp op;
+    op.fb = -1;
+    op.isCopy = true;
+    op.copy.src = src.color;
+    op.copy.dst = dst.color;
+    if (src.width == dst.width && src.height == dst.height) {
+        // Same size: the whole texture (as the D3D11 backend's CopyResource).
+        op.copy.size = { src.width, src.height };
+    } else {
+        // A region of the same size, top-left coordinates (as CopySubresourceRegion).
+        if (srcX0 < 0 || srcY0 < 0 || dstX0 < 0 || dstY0 < 0 || srcX1 > static_cast<int>(src.width) ||
+            srcY1 > static_cast<int>(src.height) || dstX1 > static_cast<int>(dst.width) ||
+            dstY1 > static_cast<int>(dst.height)) {
+            return; // out of bounds: skipped, as the D3D11 backend does
+        }
+        const uint32_t w = static_cast<uint32_t>(std::min(srcX1 - srcX0, static_cast<int>(dst.width) - dstX0));
+        const uint32_t h = static_cast<uint32_t>(std::min(srcY1 - srcY0, static_cast<int>(dst.height) - dstY0));
+        if (w == 0 || h == 0) {
+            return;
+        }
+        op.copy.srcOrigin = { static_cast<uint32_t>(srcX0), static_cast<uint32_t>(srcY0) };
+        op.copy.dstOrigin = { static_cast<uint32_t>(dstX0), static_cast<uint32_t>(dstY0) };
+        op.copy.size = { w, h };
+    }
+    mFrames[mRecordingSlot].push_back(std::move(op));
+    ++mStatCopies;
 }
 
 void GfxRenderingAPIAurora::ClearFramebuffer(bool color, bool depth) {
@@ -930,19 +1081,144 @@ void GfxRenderingAPIAurora::ClearDepthRegion(int, int, int, int) {
     ClearFramebuffer(false, true);
 }
 
-void GfxRenderingAPIAurora::ReadFramebufferToCPU(int, uint32_t width, uint32_t height, uint16_t* rgba16Buf) {
+void GfxRenderingAPIAurora::ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) {
     std::memset(rgba16Buf, 0, static_cast<size_t>(width) * height * sizeof(uint16_t));
+    if (!mDevice || fbId < 0 || fbId >= static_cast<int>(mFramebuffers.size()) || width == 0 || height == 0) {
+        return;
+    }
+    // E2: what this frame drew so far must be on the GPU before reading it.
+    ExecuteRecordedNow();
+    const Framebuffer& f = mFramebuffers[fbId];
+    if (!f.color) {
+        return;
+    }
+    const uint32_t row = (f.width * 4 + 255) / 256 * 256;
+    wgpu::BufferDescriptor bd{};
+    bd.label = "Fast3D framebuffer readback";
+    bd.size = static_cast<uint64_t>(row) * f.height;
+    bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    auto buf = mDevice.CreateBuffer(&bd);
+    auto cmd = mDevice.CreateCommandEncoder();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = f.color;
+    wgpu::TexelCopyBufferInfo dst{};
+    dst.buffer = buf;
+    dst.layout.bytesPerRow = row;
+    dst.layout.rowsPerImage = f.height;
+    wgpu::Extent3D size{ f.width, f.height, 1 };
+    cmd.CopyTextureToBuffer(&src, &dst, &size);
+    auto cb = cmd.Finish();
+    mDevice.GetQueue().Submit(1, &cb);
+    if (!WaitForMap(buf, bd.size)) {
+        SPDLOG_ERROR("Aurora backend: framebuffer readback failed");
+        return;
+    }
+    const auto* data = static_cast<const uint8_t*>(buf.GetConstMappedRange(0, bd.size));
+    // As the D3D11 backend: nearest scaling to the requested size, RGBA8 -> RGBA5551.
+    for (uint32_t j = 0; j < height; j++) {
+        const uint32_t srcY = j * f.height / height;
+        const auto* srcRow = reinterpret_cast<const uint32_t*>(data + static_cast<size_t>(srcY) * row);
+        for (uint32_t i = 0; i < width; i++) {
+            const uint32_t pixel = srcRow[i * f.width / width];
+            const uint8_t r = (((pixel & 0xFF) + 4) * 0x1F) / 0xFF;
+            const uint8_t g = ((((pixel >> 8) & 0xFF) + 4) * 0x1F) / 0xFF;
+            const uint8_t b = ((((pixel >> 16) & 0xFF) + 4) * 0x1F) / 0xFF;
+            const uint8_t a = ((pixel >> 24) & 0xFF) ? 1 : 0;
+            rgba16Buf[i + j * width] = (r << 11) | (g << 6) | (b << 1) | a;
+        }
+    }
+    buf.Unmap();
+    ++mStatReads;
 }
 
-void GfxRenderingAPIAurora::ResolveMSAAColorBuffer(int, int) {
+void GfxRenderingAPIAurora::ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) {
+    // Rendering is single-sample, so a resolve is a copy.
+    if (fbIdSrc < 0 || fbIdSrc >= static_cast<int>(mFramebuffers.size())) {
+        return;
+    }
+    const Framebuffer& src = mFramebuffers[fbIdSrc];
+    CopyFramebuffer(fbIdTarger, fbIdSrc, 0, 0, static_cast<int>(src.width), static_cast<int>(src.height), 0, 0,
+                    static_cast<int>(src.width), static_cast<int>(src.height));
 }
 
 std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
-GfxRenderingAPIAurora::GetPixelDepth(int, const std::set<std::pair<float, float>>& coordinates) {
+GfxRenderingAPIAurora::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
     for (const auto& c : coordinates) {
         res.emplace(c, 0);
     }
+    if (!mDevice || coordinates.empty() || fb_id < 0 || fb_id >= static_cast<int>(mFramebuffers.size())) {
+        return res;
+    }
+    // E4: MM asks before this frame's Run, so this is the last completed frame's
+    // depth; draining the worker puts that frame on the queue first.
+    ExecuteRecordedNow();
+    const Framebuffer& f = mFramebuffers[fb_id];
+    if (!f.depthView) {
+        return res;
+    }
+    std::vector<int32_t> coords;
+    coords.reserve(coordinates.size() * 2);
+    for (const auto& c : coordinates) {
+        coords.push_back(static_cast<int32_t>(c.first));
+        // gfx_pc's coordinates are bottom-left; textures are top-left (as D3D11).
+        coords.push_back(static_cast<int32_t>(f.height) - 1 - static_cast<int32_t>(c.second));
+    }
+    const uint64_t n = coordinates.size();
+    wgpu::BufferDescriptor cd{};
+    cd.label = "Fast3D depth coords";
+    cd.size = n * 8;
+    cd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    auto coordBuf = mDevice.CreateBuffer(&cd);
+    mDevice.GetQueue().WriteBuffer(coordBuf, 0, coords.data(), cd.size);
+    wgpu::BufferDescriptor od{};
+    od.label = "Fast3D depth values";
+    od.size = std::max<uint64_t>(n * 4, 4);
+    od.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+    auto outBuf = mDevice.CreateBuffer(&od);
+    wgpu::BufferDescriptor rd{};
+    rd.label = "Fast3D depth readback";
+    rd.size = od.size;
+    rd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    auto readBuf = mDevice.CreateBuffer(&rd);
+    wgpu::BindGroupEntry e[3]{};
+    e[0].binding = 0;
+    e[0].textureView = f.depthView;
+    e[1].binding = 1;
+    e[1].buffer = coordBuf;
+    e[2].binding = 2;
+    e[2].buffer = outBuf;
+    wgpu::BindGroupDescriptor bgd{};
+    bgd.layout = mDepthPipeline.GetBindGroupLayout(0);
+    bgd.entryCount = 3;
+    bgd.entries = e;
+    auto bg = mDevice.CreateBindGroup(&bgd);
+    auto cmd = mDevice.CreateCommandEncoder();
+    auto pass = cmd.BeginComputePass();
+    pass.SetPipeline(mDepthPipeline);
+    pass.SetBindGroup(0, bg);
+    pass.DispatchWorkgroups(static_cast<uint32_t>(n));
+    pass.End();
+    cmd.CopyBufferToBuffer(outBuf, 0, readBuf, 0, od.size);
+    auto cb = cmd.Finish();
+    mDevice.GetQueue().Submit(1, &cb);
+    if (!WaitForMap(readBuf, rd.size)) {
+        SPDLOG_ERROR("Aurora backend: depth readback failed");
+        return res;
+    }
+    const auto* values = static_cast<const float*>(readBuf.GetConstMappedRange(0, rd.size));
+    size_t i = 0;
+    for (const auto& c : coordinates) {
+        res[c] = static_cast<uint16_t>(values[i++] * 65532.0f);
+    }
+    if (mStatDepthReads < 3) {
+        const auto& first = *coordinates.begin();
+        AuroraTrace("[lus-aurora] depth read %llu: %zu point(s), first (%.0f, %.0f) -> %.6f (%u)",
+                    static_cast<unsigned long long>(mStatDepthReads + 1), coordinates.size(), first.first,
+                    first.second, values[0], static_cast<unsigned>(res[first]));
+    }
+    readBuf.Unmap();
+    ++mStatDepthReads;
     return res;
 }
 
@@ -954,43 +1230,50 @@ void* GfxRenderingAPIAurora::GetFramebufferTextureId(int fbId) {
 }
 
 void GfxRenderingAPIAurora::SelectTextureFb(int fbId) {
-    if (fbId < 0 || fbId >= static_cast<int>(mFramebuffers.size()) || fbId == mCurrentFb) {
-        // Sampling the target of the open pass is not allowed; copies come in a later step.
+    // As the D3D11 backend: the framebuffer becomes texture 0.
+    if (fbId < 0 || fbId >= static_cast<int>(mFramebuffers.size())) {
         return;
     }
-    mSlotFbViews[0] = mFramebuffers[fbId].colorView;
+    Framebuffer& f = mFramebuffers[fbId];
+    if (!f.color) {
+        return;
+    }
+    mSlotFbIds[0] = fbId;
+    mCurrentTile = 0;
+    if (fbId != mCurrentFb) {
+        mSlotFbViews[0] = f.colorView;
+        return;
+    }
+    // Sampling the open pass's own target is not allowed in WebGPU: sample a copy.
+    if (!f.snapshot || f.snapshot.GetWidth() != f.width || f.snapshot.GetHeight() != f.height) {
+        if (f.snapshot) {
+            mRetiredTextures.emplace_back(mFrameCounter, f.snapshot);
+        }
+        wgpu::TextureDescriptor td{};
+        td.label = "Fast3D framebuffer snapshot";
+        td.size = { f.width, f.height, 1 };
+        td.format = wgpu::TextureFormat::RGBA8Unorm;
+        td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+        f.snapshot = mDevice.CreateTexture(&td);
+        f.snapshotView = f.snapshot.CreateView();
+    }
+    if (mRecording) {
+        PassOp op;
+        op.fb = -1;
+        op.isCopy = true;
+        op.copy.src = f.color;
+        op.copy.dst = f.snapshot;
+        op.copy.size = { f.width, f.height };
+        mFrames[mRecordingSlot].push_back(std::move(op));
+        ++mStatCopies;
+    }
+    mSlotFbViews[0] = f.snapshotView;
 }
 
 // --- render worker ------------------------------------------------------------------
 
 void GfxRenderingAPIAurora::ReplayFrame(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd,
                                         uint32_t slot) {
-    // Texture uploads first: pixels from Aurora's storage stream into the textures.
-    const auto& ups = mUploads[slot];
-    if (!ups.empty()) {
-        auto cpass = cmd.BeginComputePass();
-        cpass.SetPipeline(mUploadPipeline);
-        for (const UploadOp& up : ups) {
-            if (up.range.size == 0) {
-                continue;
-            }
-            wgpu::BindGroupEntry e[2]{};
-            e[0].binding = 0;
-            e[0].buffer = ctx.storageBuffer;
-            e[0].offset = up.range.offset;
-            e[0].size = up.range.size;
-            e[1].binding = 1;
-            e[1].textureView = up.storageView;
-            wgpu::BindGroupDescriptor bgd{};
-            bgd.layout = mUploadBgl;
-            bgd.entryCount = 2;
-            bgd.entries = e;
-            cpass.SetBindGroup(0, ctx.device.CreateBindGroup(&bgd));
-            cpass.DispatchWorkgroups((up.width + 7) / 8, (up.height + 7) / 8);
-        }
-        cpass.End();
-    }
-
     // The uniform bind group for Aurora's uniform buffer (one per buffer object).
     auto ubIt = mUniformBindGroups.find(ctx.uniformBuffer.Get());
     if (ubIt == mUniformBindGroups.end()) {
@@ -1004,8 +1287,50 @@ void GfxRenderingAPIAurora::ReplayFrame(const gfx::EncoderTaskContext& ctx, cons
         bgd.entries = &e;
         ubIt = mUniformBindGroups.emplace(ctx.uniformBuffer.Get(), ctx.device.CreateBindGroup(&bgd)).first;
     }
+    ReplayOps(ctx.device, cmd, mUploads[slot], mFrames[slot], ctx.storageBuffer, ctx.vertexBuffer, ubIt->second);
+}
 
-    for (const PassOp& op : mFrames[slot]) {
+void GfxRenderingAPIAurora::ReplayOps(const wgpu::Device& device, const wgpu::CommandEncoder& cmd,
+                                      const std::vector<UploadOp>& ups, const std::vector<PassOp>& ops,
+                                      const wgpu::Buffer& storageBuffer, const wgpu::Buffer& vertexBuffer,
+                                      const wgpu::BindGroup& uniforms) {
+    // Texture uploads first: pixels from a storage buffer into the textures.
+    if (!ups.empty()) {
+        auto cpass = cmd.BeginComputePass();
+        cpass.SetPipeline(mUploadPipeline);
+        for (const UploadOp& up : ups) {
+            if (up.range.size == 0) {
+                continue;
+            }
+            wgpu::BindGroupEntry e[2]{};
+            e[0].binding = 0;
+            e[0].buffer = storageBuffer;
+            e[0].offset = up.range.offset;
+            e[0].size = up.range.size;
+            e[1].binding = 1;
+            e[1].textureView = up.storageView;
+            wgpu::BindGroupDescriptor bgd{};
+            bgd.layout = mUploadBgl;
+            bgd.entryCount = 2;
+            bgd.entries = e;
+            cpass.SetBindGroup(0, device.CreateBindGroup(&bgd));
+            cpass.DispatchWorkgroups((up.width + 7) / 8, (up.height + 7) / 8);
+        }
+        cpass.End();
+    }
+
+    for (const PassOp& op : ops) {
+        if (op.isCopy) {
+            wgpu::TexelCopyTextureInfo src{};
+            src.texture = op.copy.src;
+            src.origin = { op.copy.srcOrigin[0], op.copy.srcOrigin[1], 0 };
+            wgpu::TexelCopyTextureInfo dst{};
+            dst.texture = op.copy.dst;
+            dst.origin = { op.copy.dstOrigin[0], op.copy.dstOrigin[1], 0 };
+            wgpu::Extent3D size{ op.copy.size[0], op.copy.size[1], 1 };
+            cmd.CopyTextureToTexture(&src, &dst, &size);
+            continue;
+        }
         wgpu::RenderPassColorAttachment ca{};
         ca.view = op.colorView;
         ca.loadOp = op.clearColor ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
@@ -1029,15 +1354,97 @@ void GfxRenderingAPIAurora::ReplayFrame(const gfx::EncoderTaskContext& ctx, cons
                 continue;
             }
             pass.SetPipeline(d.pipeline);
-            pass.SetBindGroup(0, ubIt->second, 1, &d.uniformOffset);
+            pass.SetBindGroup(0, uniforms, 1, &d.uniformOffset);
             pass.SetBindGroup(1, d.textures);
-            pass.SetVertexBuffer(0, ctx.vertexBuffer, d.verts.offset, d.verts.size);
+            pass.SetVertexBuffer(0, vertexBuffer, d.verts.offset, d.verts.size);
             pass.SetViewport(d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], 0.0f, 1.0f);
             pass.SetScissorRect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
             pass.Draw(d.vertexCount);
         }
         pass.End();
     }
+}
+
+bool GfxRenderingAPIAurora::WaitForMap(const wgpu::Buffer& buffer, uint64_t size) {
+    bool mapped = false;
+    auto future = buffer.MapAsync(wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::WaitAnyOnly,
+                                  [&mapped](wgpu::MapAsyncStatus s, wgpu::StringView) {
+                                      mapped = s == wgpu::MapAsyncStatus::Success;
+                                  });
+    return mInstance.WaitAny(future, UINT64_MAX) == wgpu::WaitStatus::Success && mapped;
+}
+
+void GfxRenderingAPIAurora::ExecuteRecordedNow() {
+    // E2/E3: the worker must be drained before the game thread uses the queue.
+    AuroraBridge::Gfx::Synchronize();
+    if (!mRecording) {
+        return; // nothing recorded this frame: earlier frames are already submitted
+    }
+    auto& ops = mFrames[mRecordingSlot];
+    if (ops.empty() && mPendingUploads.empty()) {
+        return;
+    }
+    auto align = [](std::vector<uint8_t>& v, size_t a) { v.resize((v.size() + a - 1) / a * a); };
+    std::vector<uint8_t> sdata, vdata, udata;
+    std::vector<UploadOp> ups;
+    for (const PendingUpload& p : mPendingUploads) {
+        align(sdata, 256);
+        UploadOp op;
+        op.storageView = p.storageView;
+        op.width = p.width;
+        op.height = p.height;
+        op.range.offset = static_cast<uint32_t>(sdata.size());
+        op.range.size = static_cast<uint32_t>(p.words.size() * 4);
+        const auto* b = reinterpret_cast<const uint8_t*>(p.words.data());
+        sdata.insert(sdata.end(), b, b + op.range.size);
+        ups.push_back(std::move(op));
+    }
+    for (PassOp& op : ops) {
+        for (DrawOp& d : op.drawOps) {
+            align(vdata, 4);
+            d.verts.offset = static_cast<uint32_t>(vdata.size());
+            d.verts.size = static_cast<uint32_t>(d.vertsCpu.size() * sizeof(float));
+            const auto* b = reinterpret_cast<const uint8_t*>(d.vertsCpu.data());
+            vdata.insert(vdata.end(), b, b + d.verts.size);
+            align(udata, 256);
+            d.uniformOffset = static_cast<uint32_t>(udata.size());
+            udata.insert(udata.end(), d.uniformsCpu.begin(), d.uniformsCpu.end());
+        }
+    }
+    auto make = [&](const std::vector<uint8_t>& data, wgpu::BufferUsage usage, const char* label) {
+        wgpu::BufferDescriptor bd{};
+        bd.label = label;
+        bd.size = std::max<uint64_t>(256, (data.size() + 3) / 4 * 4);
+        bd.usage = usage | wgpu::BufferUsage::CopyDst;
+        auto buf = mDevice.CreateBuffer(&bd);
+        if (!data.empty()) {
+            std::vector<uint8_t> padded(data);
+            padded.resize((data.size() + 3) / 4 * 4);
+            mDevice.GetQueue().WriteBuffer(buf, 0, padded.data(), padded.size());
+        }
+        return buf;
+    };
+    auto sbuf = make(sdata, wgpu::BufferUsage::Storage, "Fast3D flush storage");
+    auto vbuf = make(vdata, wgpu::BufferUsage::Vertex, "Fast3D flush vertices");
+    udata.resize(udata.size() + 256); // room for the last binding
+    auto ubuf = make(udata, wgpu::BufferUsage::Uniform, "Fast3D flush uniforms");
+    wgpu::BindGroupEntry ue{};
+    ue.binding = 0;
+    ue.buffer = ubuf;
+    ue.size = sizeof(DrawUniforms);
+    wgpu::BindGroupDescriptor ubd{};
+    ubd.layout = mUniformBgl;
+    ubd.entryCount = 1;
+    ubd.entries = &ue;
+    auto ubg = mDevice.CreateBindGroup(&ubd);
+
+    auto cmd = mDevice.CreateCommandEncoder();
+    ReplayOps(mDevice, cmd, ups, ops, sbuf, vbuf, ubg);
+    auto cb = cmd.Finish();
+    mDevice.GetQueue().Submit(1, &cb);
+    // Executed: the rest of the frame continues on what is now in the textures.
+    ops.clear();
+    mPendingUploads.clear();
 }
 
 void GfxRenderingAPIAurora::DrawComposite(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
@@ -1107,6 +1514,61 @@ void GfxRenderingAPIAurora::DrawComposite(const gfx::DrawContext& ctx, const wgp
     pass.SetPipeline(mCompositePipeline);
     pass.SetBindGroup(0, mCompositeBg);
     pass.Draw(3);
+}
+
+void GfxRenderingAPIAurora::RenderImGui(ImDrawData* data) {
+    if (!mRecording || data == nullptr || !data->Valid || data->CmdListsCount == 0) {
+        return;
+    }
+    const gfx::RenderTargetLayout layout = AuroraBridge::Gfx::SceneLayout();
+    const bool fontsChanged = ImGui::GetIO().Fonts->TexID == static_cast<ImTextureID>(nullptr);
+    if (!mImGuiReady || layout.key != mImGuiLayoutKey || fontsChanged) {
+        // E3: the renderer creates and uploads its font texture through the queue.
+        AuroraBridge::Gfx::Synchronize();
+        if (mImGuiReady) {
+            ImGui_ImplWGPU_Shutdown();
+        }
+        ImGui_ImplWGPU_InitInfo info;
+        info.Device = mDevice.Get();
+        info.NumFramesInFlight = FrameSlots;
+        info.RenderTargetFormat = static_cast<WGPUTextureFormat>(layout.colorAttachments[0].format);
+        info.DepthStencilFormat = static_cast<WGPUTextureFormat>(layout.depthStencilFormat);
+        info.PipelineMultisampleState.count = layout.sampleCount;
+        info.PipelineMultisampleState.mask = UINT32_MAX;
+        ImGui_ImplWGPU_Init(&info);
+        ImGui_ImplWGPU_CreateDeviceObjects();
+        mImGuiReady = true;
+        mImGuiLayoutKey = layout.key;
+        AuroraTrace("[lus-aurora] ImGui renderer ready (scene format %d, depth %d, %u sample(s))",
+                    static_cast<int>(layout.colorAttachments[0].format), static_cast<int>(layout.depthStencilFormat),
+                    layout.sampleCount);
+    }
+    // Commands recorded while the font atlas had no texture (it was just rebuilt)
+    // carry a null id; they mean the font texture the renderer has now created.
+    auto fontTexture = ImGui::GetIO().Fonts->TexID; // ImTextureID is a macro (void*) here
+    if (fontTexture == static_cast<ImTextureID>(nullptr)) {
+        return;
+    }
+    // ImGui reuses its draw lists next frame; the worker draws a copy.
+    ImDrawData*& copy = mImGuiFrames[mRecordingSlot];
+    FreeDrawData(copy);
+    copy = IM_NEW(ImDrawData)();
+    *copy = *data;
+    for (int i = 0; i < data->CmdLists.Size; ++i) {
+        copy->CmdLists[i] = data->CmdLists[i]->CloneOutput();
+        for (ImDrawCmd& cmd : copy->CmdLists[i]->CmdBuffer) {
+            if (cmd.TextureId == static_cast<ImTextureID>(nullptr)) {
+                cmd.TextureId = fontTexture;
+            }
+        }
+    }
+    mImGuiThisFrame[mRecordingSlot] = true;
+}
+
+void GfxRenderingAPIAurora::DrawImGui(const wgpu::RenderPassEncoder& pass, uint32_t slot) {
+    if (mImGuiReady && mImGuiFrames[slot] != nullptr) {
+        ImGui_ImplWGPU_RenderDrawData(mImGuiFrames[slot], pass.Get());
+    }
 }
 
 void GfxRenderingAPIAurora::SelfTestCopy(const wgpu::CommandEncoder& cmd, WGPUTexture texture) {
