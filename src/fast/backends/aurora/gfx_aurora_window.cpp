@@ -1,12 +1,15 @@
 #ifdef ENABLE_AURORA
 
 #include "fast/backends/gfx_aurora.h"
+#include "ship/Context.h"
 
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <string>
 
 #include <csignal>
@@ -123,6 +126,22 @@ void BridgeLog(AuroraBridge::LogLevel level, const char* module, const char* mes
             SPDLOG_ERROR("[aurora:{}] {}", module, message);
             break;
     }
+}
+
+// libultraship's keyboard scancodes are the DXGI backend's: the platform scan
+// code with 0x100 for extended keys ((lParam >> 16) & 0x1ff). SDL3's 'raw' key
+// field carries the platform scan code; accept either extended form (0x1xx or
+// 0xE0xx). Other platforms need a table (gfx_sdl2.cpp's is file-local).
+int LusScancode(int raw) {
+#ifdef _WIN32
+    if ((raw & 0xFF00) == 0xE000) {
+        return (raw & 0xFF) | 0x100;
+    }
+    return raw & 0x1FF;
+#else
+    (void)raw;
+    return 0;
+#endif
 }
 
 // LUS_AURORA_BACKEND=d3d12|vulkan|d3d11|opengl picks Aurora's GPU API (default: Aurora's choice).
@@ -261,6 +280,13 @@ void GfxWindowBackendAurora::HandleEvents() {
     }
     AuroraBridge::Event events[64];
     const int n = AuroraBridge::Poll(events, 64);
+    static uint64_t sCalls = 0, sEvents = 0;
+    ++sCalls;
+    sEvents += static_cast<uint64_t>(n);
+    if (sCalls == 1 || sCalls == 60 || sCalls == 600) {
+        AuroraTrace("[lus-aurora] HandleEvents #%llu: %llu translated events so far",
+                    static_cast<unsigned long long>(sCalls), static_cast<unsigned long long>(sEvents));
+    }
     for (int i = 0; i < n; ++i) {
         const auto& ev = events[i];
         switch (ev.type) {
@@ -281,8 +307,22 @@ void GfxWindowBackendAurora::HandleEvents() {
             case AuroraBridge::Event::Type::FocusLost:
                 if (mOnAllKeysUp != nullptr) mOnAllKeysUp();
                 break;
-            // Keyboard: SDL scancodes reach the bridge; mapping them to libultraship's
-            // scancodes comes with the input step (gfx_sdl2.cpp's table is file-local).
+            case AuroraBridge::Event::Type::KeyDown:
+            case AuroraBridge::Event::Type::KeyUp: {
+                const bool down = ev.type == AuroraBridge::Event::Type::KeyDown;
+                const int key = LusScancode(ev.b);
+                static int sTraced = 0;
+                if (sTraced < 10) {
+                    ++sTraced;
+                    AuroraTrace("[lus-aurora] key %s: SDL %d, raw 0x%x -> libultraship 0x%x", down ? "down" : "up",
+                                ev.a, ev.b, key);
+                }
+                if (key != 0) {
+                    if (down && mOnKeyDown != nullptr) mOnKeyDown(key);
+                    if (!down && mOnKeyUp != nullptr) mOnKeyUp(key);
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -305,8 +345,43 @@ bool GfxWindowBackendAurora::BeginFrameIfNeeded() {
     return mFrameOpen;
 }
 
+void GfxWindowBackendAurora::WaitForNextFrame() {
+    // Hold each frame to 1 / target FPS after the previous one, like the DXGI
+    // backend: a coarse wait, then a short spin for the last 1.5 ms. Aurora's
+    // present adds vsync on top when enabled.
+    if (Ship::Context::HostPacesFrames() || mTargetFps <= 0) {
+        mPreviousPresentTime = AuroraBridge::GetTime();
+        return;
+    }
+    const double next = mPreviousPresentTime + 1.0 / static_cast<double>(mTargetFps);
+    double now = AuroraBridge::GetTime();
+    const double coarse = next - now - 0.0015;
+    if (coarse > 0) {
+#ifdef _WIN32
+        if (mTimer == nullptr) {
+            mTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (mTimer == nullptr) {
+                mTimer = CreateWaitableTimer(nullptr, FALSE, nullptr);
+            }
+        }
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>(coarse * 1e7); // 100 ns units, relative
+        SetWaitableTimer(static_cast<HANDLE>(mTimer), &due, 0, nullptr, nullptr, false);
+        WaitForSingleObject(static_cast<HANDLE>(mTimer), INFINITE);
+#else
+        std::this_thread::sleep_for(std::chrono::duration<double>(coarse));
+#endif
+    }
+    do {
+        now = AuroraBridge::GetTime();
+    } while (now < next);
+    // A frame that ran long starts the schedule again rather than racing to catch up.
+    mPreviousPresentTime = (now - next > 1.0 / static_cast<double>(mTargetFps)) ? now : next;
+}
+
 void GfxWindowBackendAurora::SwapBuffersBegin() {
     if (mFrameOpen) {
+        WaitForNextFrame();
         AuroraBridge::EndFrame();
         mFrameOpen = false;
     }
@@ -347,6 +422,12 @@ void GfxWindowBackendAurora::Destroy() {
         AuroraBridge::Shutdown();
         mInitialized = false;
     }
+#ifdef _WIN32
+    if (mTimer != nullptr) {
+        CloseHandle(static_cast<HANDLE>(mTimer));
+        mTimer = nullptr;
+    }
+#endif
 }
 
 bool GfxWindowBackendAurora::IsFullscreen() {

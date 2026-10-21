@@ -9,12 +9,15 @@
 // framebuffer 0 into Aurora's scene pass with one custom draw. Aurora owns the
 // window, device, queue, frame encoder, submit and present.
 //
-// Step 1 (this version): window, frame lifecycle, framebuffers, clears and the
-// composite. Draws, textures and readbacks are accepted and counted but not
-// rendered yet.
+// Step 1: window, frame lifecycle, framebuffers, clears and the composite.
+// Step 2: WGSL combiners, pipelines, textures, samplers and draws. Copies,
+// resolves and readbacks come in later steps.
 
 #include <array>
+#include <deque>
 #include <map>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,7 +26,12 @@
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/backends/gfx_window_manager_api.h"
 
+struct CCFeatures;
+
 namespace Fast {
+
+// Builds the WGSL module for one Fast3D combiner (gfx_aurora_shader.cpp).
+std::string BuildAuroraShader(const ::CCFeatures& cc, bool threePointFiltering, bool srgbMode);
 
 // Writes to lus_aurora_trace.log (working directory) and stderr. Aurora aborts on
 // a fatal error before spdlog flushes, and on Windows libultraship points stderr
@@ -81,6 +89,10 @@ class GfxWindowBackendAurora final : public GfxWindowBackend {
     int32_t mPosX = 0;
     int32_t mPosY = 0;
     uint32_t mMouseButtons = 0;
+    // Frame pacing to the target FPS (as GfxWindowBackendDXGI::SwapBuffersBegin).
+    void WaitForNextFrame();
+    double mPreviousPresentTime = 0.0;
+    void* mTimer = nullptr; // Windows high-resolution waitable timer
     void (*mOnAllKeysUp)() = nullptr;
 };
 
@@ -136,7 +148,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     void SetCurrentPrimDepth(float depth) override;
 
     // Render-worker callbacks (Aurora encoder task and custom draw).
-    void ReplayFrame(const wgpu::CommandEncoder& cmd, uint32_t slot);
+    void ReplayFrame(const aurora::gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, uint32_t slot);
     void DrawComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
                        WGPUTextureView view);
     void SelfTestCopy(const wgpu::CommandEncoder& cmd, WGPUTexture texture);
@@ -153,7 +165,18 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
         wgpu::TextureView depthView;
     };
 
-    // One recorded pass (step 1: begin/clear only).
+    // One recorded draw: everything the worker needs, captured at record time.
+    struct DrawOp {
+        wgpu::RenderPipeline pipeline;
+        wgpu::BindGroup textures;
+        aurora::gfx::Range verts;
+        uint32_t uniformOffset = 0;
+        uint32_t vertexCount = 0;
+        std::array<float, 4> viewport{}; // x, y, w, h (top-left origin, clamped to the target)
+        std::array<uint32_t, 4> scissor{}; // x, y, w, h (clamped to the target)
+    };
+
+    // One recorded pass on a backend-owned framebuffer.
     struct PassOp {
         int fb = 0;
         bool clearColor = false;
@@ -163,6 +186,34 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
         // Targets captured at record time, so the worker never reads mFramebuffers.
         wgpu::TextureView colorView;
         wgpu::TextureView depthView;
+        std::vector<DrawOp> drawOps;
+    };
+
+    // A texture upload: pixels in Aurora's storage stream, written by a compute
+    // pass in the frame's encoder task (no queue writes from the game thread, E3).
+    struct UploadOp {
+        wgpu::TextureView storageView;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        aurora::gfx::Range range;
+    };
+
+    struct PendingUpload {
+        wgpu::TextureView storageView;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::vector<uint32_t> words; // width, height, then RGBA8 pixels
+    };
+
+    struct TextureAurora {
+        wgpu::Texture texture;
+        wgpu::TextureView view;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool linear = false;
+        uint32_t cms = 0;
+        uint32_t cmt = 0;
+        int filtering = FILTER_THREE_POINT;
     };
 
     struct ShaderProgramAurora {
@@ -170,13 +221,24 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
         uint64_t id1 = 0;
         uint8_t numInputs = 0;
         bool usedTextures[2]{};
+        bool alpha = false;
+        wgpu::ShaderModule module;
+        std::vector<wgpu::VertexAttribute> attributes;
+        uint32_t stride = 0;
     };
 
   private:
     static constexpr uint32_t FrameSlots = 3; // Aurora keeps 2 frames in flight; one more for recording.
+    static constexpr uint32_t TextureSlots = 6; // tex0, tex1, mask0, mask1, blend0, blend1
+    static constexpr size_t UploadBudgetPerFrame = 6u << 20; // of Aurora's 8 MiB storage stream
 
     void BeginPass(int fb);
     void RetireResources();
+    void CreateSharedObjects();
+    wgpu::RenderPipeline GetPipeline(ShaderProgramAurora* prg, bool hasDepth);
+    wgpu::Sampler GetSampler(bool linear, uint32_t cms, uint32_t cmt);
+    wgpu::BindGroup GetTextureBindGroup();
+    void FlushUploads();
 
     GfxWindowBackendAurora* mWindow;
     wgpu::Device mDevice;
@@ -187,18 +249,49 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     std::vector<Framebuffer> mFramebuffers;
     int mCurrentFb = 0;
     std::array<std::vector<PassOp>, FrameSlots> mFrames;
+    std::array<std::vector<UploadOp>, FrameSlots> mUploads;
     // Framebuffer 0's view per slot: holds the reference the composite draw samples.
     std::array<wgpu::TextureView, FrameSlots> mCompositeViews;
     uint32_t mFrameCounter = 0;
     uint32_t mRecordingSlot = 0;
     bool mRecording = false;
-    // Textures replaced by a resize, kept until no frame in flight can use them.
+    // Objects replaced mid-run (resized framebuffers), kept until no frame in flight can use them.
     std::vector<std::pair<uint32_t, Framebuffer>> mRetired;
+    std::vector<std::pair<uint32_t, wgpu::Texture>> mRetiredTextures;
 
+    // Shaders and pipelines.
     std::map<std::pair<uint64_t, uint64_t>, ShaderProgramAurora> mShaders;
     ShaderProgramAurora* mCurrentShader = nullptr;
-    uint32_t mTextureCount = 0;
+    std::unordered_map<uint64_t, wgpu::RenderPipeline> mPipelines;
+    wgpu::BindGroupLayout mUniformBgl;
+    wgpu::BindGroupLayout mTextureBgl;
+    wgpu::PipelineLayout mPipelineLayout;
+    bool mUseAlpha = false;
+
+    // Textures and samplers.
+    std::vector<TextureAurora> mTextures;
+    std::array<uint32_t, TextureSlots> mSlotTextures{};
+    std::array<wgpu::TextureView, TextureSlots> mSlotFbViews; // SelectTextureFb overrides a slot
+    int mCurrentTile = 0;
+    std::map<uint32_t, wgpu::Sampler> mSamplers;
+    std::map<std::array<void*, TextureSlots + 2>, std::pair<wgpu::BindGroup, uint32_t>> mTextureBindGroups;
+    wgpu::Texture mDummyTexture;
+    wgpu::TextureView mDummyView;
+    std::deque<PendingUpload> mPendingUploads;
     FilteringMode mFilter = FILTER_THREE_POINT;
+
+    // Upload compute pipeline (worker uses it).
+    wgpu::ComputePipeline mUploadPipeline;
+    wgpu::BindGroupLayout mUploadBgl;
+
+    // Per-draw state.
+    std::array<int, 4> mViewport{}; // x, y, w, h as Fast3D gives them (bottom-left origin)
+    std::array<int, 4> mScissor{};
+    float mNoiseScale = 1.0f;
+    int32_t mFrameCountUniform = 0;
+
+    // Worker-side: uniform bind group per Aurora uniform buffer.
+    std::map<WGPUBuffer, wgpu::BindGroup> mUniformBindGroups;
 
     // Composite (worker thread only).
     wgpu::RenderPipeline mCompositePipeline;
@@ -209,7 +302,8 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     wgpu::BindGroup mCompositeBg;
 
     // Diagnostics: LUS_AURORA_DEBUG_CLEAR=r,g,b (0-255) overrides framebuffer 0's
-    // clear colour; LUS_AURORA_SELFTEST=<frame> logs the scene's centre pixel then.
+    // clear colour; LUS_AURORA_SELFTEST=<frame> logs the scene's centre pixel then;
+    // with LUS_AURORA_SELFTEST set, each new WGSL module is written to lus_aurora_shaders/.
     bool mDebugClear = false;
     std::array<float, 4> mDebugClearColor{ 0.0f, 0.0f, 0.0f, 1.0f };
     uint32_t mSelfTestFrame = 0;
@@ -219,12 +313,15 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     uint32_t mSelfTestX = 0;
     uint32_t mSelfTestY = 0;
 
-    // Step-1 counters, logged once a second.
+    // Counters, logged once a second.
     uint64_t mStatFrames = 0;
     uint64_t mStatDraws = 0;
     uint64_t mStatTris = 0;
     uint64_t mStatClears = 0;
     uint64_t mStatPasses = 0;
+    uint64_t mStatUploads = 0;
+    uint64_t mStatShaders = 0;
+    uint64_t mStatSkippedDraws = 0;
     double mStatLastLog = 0;
 };
 

@@ -92,10 +92,12 @@ int Poll(Event* events, int max) {
                     case SDL_EVENT_KEY_DOWN:
                         out.type = Event::Type::KeyDown;
                         out.a = static_cast<int32_t>(ev->sdl.key.scancode);
+                        out.b = static_cast<int32_t>(ev->sdl.key.raw);
                         break;
                     case SDL_EVENT_KEY_UP:
                         out.type = Event::Type::KeyUp;
                         out.a = static_cast<int32_t>(ev->sdl.key.scancode);
+                        out.b = static_cast<int32_t>(ev->sdl.key.raw);
                         break;
                     case SDL_EVENT_MOUSE_BUTTON_DOWN:
                         out.type = Event::Type::MouseDown;

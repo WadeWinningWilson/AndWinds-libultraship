@@ -56,8 +56,8 @@ struct Event {
         None,
         Exit,
         Resized,     // a = width, b = height (pixels)
-        KeyDown,     // a = SDL scancode (same values in SDL2 and SDL3)
-        KeyUp,       // a = SDL scancode
+        KeyDown,     // a = SDL scancode (same values in SDL2 and SDL3), b = platform scancode (SDL3 'raw')
+        KeyUp,       // a = SDL scancode, b = platform scancode
         MouseDown,   // a = button (1 left, 2 middle, 3 right)
         MouseUp,     // a = button
         FocusLost,
