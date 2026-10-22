@@ -1252,6 +1252,9 @@ void GfxRenderingAPIAurora::ClearFramebuffer(bool color, bool depth) {
     PassOp& op = ops.back();
     op.clearColor = op.clearColor || color;
     op.clearDepth = op.clearDepth || depth;
+    if (op.fb == mOverlayFb) {
+        return; // the 2D layer keeps its transparent clear (StartDrawToFramebuffer); a depth clear never makes it opaque
+    }
     op.color = (op.fb == 0 && mDebugClear) ? mDebugClearColor : std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
 }
 
