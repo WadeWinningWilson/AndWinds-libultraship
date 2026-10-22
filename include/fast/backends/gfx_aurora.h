@@ -154,6 +154,13 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
 
     // Render-worker callbacks (Aurora encoder task and custom draw).
     void ReplayFrame(const aurora::gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, uint32_t slot);
+    // Hosted: the game's 2D layer (its overlay display list, drawn into this framebuffer), composited over the
+    // host's scene after it (ALBT&M: MM's message boxes, HUD and cutscene text in front of the visitor). -1 = none.
+    void SetOverlayFramebuffer(int fb) {
+        mOverlayFb = fb;
+    }
+    void DrawOverlayComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
+                              WGPUTextureView view);
     void DrawComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
                        WGPUTextureView view, WGPUTextureView depthView = nullptr);
     // Hosted world (ALBT&W HR10-Q4): framebuffer 0 composited with its depth turned into the host camera's.
@@ -298,6 +305,14 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     wgpu::Device mDevice;
     aurora::gfx::EncoderTaskId mReplayTask = aurora::gfx::InvalidEncoderTask;
     aurora::gfx::DrawTypeId mCompositeDraw = aurora::gfx::InvalidDrawType;
+    aurora::gfx::DrawTypeId mOverlayDraw = aurora::gfx::InvalidDrawType; // "Fast3D overlay composite"
+    int mOverlayFb = -1;
+    std::array<bool, FrameSlots> mOverlayCleared{}; // the 2D layer cleared to transparent this frame
+    std::array<wgpu::TextureView, FrameSlots> mOverlayViews;
+    wgpu::RenderPipeline mOverlayPipeline;
+    uint64_t mOverlayLayoutKey = ~0ull;
+    wgpu::BindGroup mOverlayBg;
+    WGPUTextureView mOverlayBoundView = nullptr;
     aurora::gfx::EncoderTaskId mSelfTestTask = aurora::gfx::InvalidEncoderTask;
 
     std::vector<Framebuffer> mFramebuffers;

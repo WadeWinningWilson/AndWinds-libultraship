@@ -75,6 +75,12 @@ typedef struct LusAuroraHostV1 {
 } LusAuroraHostV1;
 #define LUS_AURORA_HOST_V1_BASE_SIZE offsetof(LusAuroraHostV1, world_depth)
 
+/* Drawing with a host's device: 1 = yes (the hosted Aurora backend is up). */
+int gfx_aurora_is_hosted(void);
+/* The game's 2D layer (a framebuffer it draws its overlay display list into, -1 = none): composited over the
+   host's scene after it, alpha blended, never depth tested ("Fast3D overlay composite"). */
+void gfx_aurora_set_overlay_fb(int fb);
+
 #ifdef __cplusplus
 }
 

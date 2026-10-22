@@ -171,6 +171,8 @@ struct DrawUniforms {
 };
 static_assert(sizeof(DrawUniforms) == 80);
 
+GfxRenderingAPIAurora* sHostedApi = nullptr; // hosted: the backend gfx_aurora_set_overlay_fb reaches
+
 struct ReplayPayload {
     GfxRenderingAPIAurora* self;
     uint32_t slot;
@@ -218,6 +220,12 @@ void CompositeTrampoline(const gfx::DrawContext& ctx, const wgpu::RenderPassEnco
                          size_t, void*) {
     const auto& p = *static_cast<const CompositePayload*>(payload);
     p.self->DrawComposite(ctx, pass, p.view, p.depth);
+}
+
+void OverlayTrampoline(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void* payload, size_t,
+                       void*) {
+    const auto& p = *static_cast<const CompositePayload*>(payload);
+    p.self->DrawOverlayComposite(ctx, pass, p.view);
 }
 
 void SelfTestTrampoline(const gfx::EncoderTaskContext&, const wgpu::CommandEncoder& cmd, const void* payload, size_t,
@@ -402,7 +410,7 @@ wgpu::RenderPipeline GfxRenderingAPIAurora::GetPipeline(ShaderProgramAurora* prg
     // Key: program, depth test/mask/decal, blend, target has depth.
     uint64_t key = reinterpret_cast<uintptr_t>(prg);
     key = key * 31 + (depthTest ? 1 : 0) + (depthMask ? 2 : 0) + (decal ? 4 : 0) + (mUseAlpha ? 8 : 0) +
-          (hasDepth ? 16 : 0) + (samples > 1 ? 32 : 0);
+          (hasDepth ? 16 : 0) + (samples > 1 ? 32 : 0) + (mCurrentFb == mOverlayFb ? 64 : 0);
     auto it = mPipelines.find(key);
     if (it != mPipelines.end()) {
         return it->second;
@@ -416,6 +424,11 @@ wgpu::RenderPipeline GfxRenderingAPIAurora::GetPipeline(ShaderProgramAurora* prg
     wgpu::BlendState blend{};
     blend.color = { wgpu::BlendOperation::Add, wgpu::BlendFactor::SrcAlpha, wgpu::BlendFactor::OneMinusSrcAlpha };
     blend.alpha = { wgpu::BlendOperation::Add, wgpu::BlendFactor::SrcAlpha, wgpu::BlendFactor::OneMinusSrcAlpha };
+    if (mCurrentFb == mOverlayFb) {
+        // The 2D layer over a transparent clear: colour premultiplied, alpha = coverage (composited One /
+        // OneMinusSrcAlpha).
+        blend.alpha = { wgpu::BlendOperation::Add, wgpu::BlendFactor::One, wgpu::BlendFactor::OneMinusSrcAlpha };
+    }
     wgpu::ColorTargetState ct{};
     ct.format = wgpu::TextureFormat::RGBA8Unorm;
     ct.blend = mUseAlpha ? &blend : nullptr;
@@ -891,6 +904,11 @@ void GfxRenderingAPIAurora::Init() {
     mCompositeDraw =
         AuroraGfx().registerDrawType({ .label = "Fast3D composite", .draw = CompositeTrampoline, .userdata = this });
     mImGuiDraw = AuroraGfx().registerDrawType({ .label = "libultraship ImGui", .draw = ImGuiTrampoline, .userdata = this });
+    if (mHosted) {
+        mOverlayDraw = AuroraGfx().registerDrawType(
+            { .label = "Fast3D overlay composite", .draw = OverlayTrampoline, .userdata = this });
+        sHostedApi = this;
+    }
     mSelfTestTask = AuroraGfx().registerEncoderTaskType({ .label = "Fast3D self-test",
                                                                  .callback = SelfTestTrampoline,
                                                                  .userdata = this,
@@ -968,6 +986,7 @@ void GfxRenderingAPIAurora::StartFrame() {
     mUploads[mRecordingSlot].clear();
     mHostedUploads[mRecordingSlot].clear();
     mImGuiThisFrame[mRecordingSlot] = false;
+    mOverlayCleared[mRecordingSlot] = false;
     ++mFrameCountUniform;
     RetireResources();
 }
@@ -1028,6 +1047,12 @@ void GfxRenderingAPIAurora::EndFrame() {
         const CompositePayload cp{ this, mCompositeViews[mRecordingSlot].Get(),
                                    mHosted && fb0.samples == 1 && fb0.depthView ? fb0.depthView.Get() : nullptr };
         AuroraGfx().pushCustomDraw(mCompositeDraw, &cp, sizeof(cp));
+    }
+    if (mOverlayCleared[mRecordingSlot] && mOverlayFb >= 0 && mOverlayFb < static_cast<int>(mFramebuffers.size()) &&
+        mFramebuffers[mOverlayFb].colorView) {
+        mOverlayViews[mRecordingSlot] = mFramebuffers[mOverlayFb].colorView;
+        const CompositePayload op{ this, mOverlayViews[mRecordingSlot].Get(), nullptr };
+        AuroraGfx().pushCustomDraw(mOverlayDraw, &op, sizeof(op));
     }
     if (mImGuiThisFrame[mRecordingSlot] && mImGuiFrames[mRecordingSlot] != nullptr) {
         const ImGuiPayload ip{ this, mRecordingSlot };
@@ -1162,6 +1187,13 @@ void GfxRenderingAPIAurora::StartDrawToFramebuffer(int fbId, float noiseScale) {
         mNoiseScale = 1.0f / noiseScale;
     }
     BeginPass(fbId);
+    if (mRecording && fbId == mOverlayFb && !mOverlayCleared[mRecordingSlot] && !mFrames[mRecordingSlot].empty() &&
+        mFrames[mRecordingSlot].back().fb == fbId) {
+        PassOp& op = mFrames[mRecordingSlot].back();
+        op.clearColor = true; // the 2D layer starts transparent each frame
+        op.color = { 0.0f, 0.0f, 0.0f, 0.0f };
+        mOverlayCleared[mRecordingSlot] = true;
+    }
 }
 
 void GfxRenderingAPIAurora::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1,
@@ -1791,6 +1823,97 @@ void GfxRenderingAPIAurora::DrawComposite(const gfx::DrawContext& ctx, const wgp
     pass.SetPipeline(mCompositePipeline);
     pass.SetBindGroup(0, mCompositeBg);
     pass.Draw(3);
+}
+
+void GfxRenderingAPIAurora::DrawOverlayComposite(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
+                                                 WGPUTextureView view) {
+    if (view == nullptr) {
+        return;
+    }
+    if (!mCompositeBgl) {
+        wgpu::BindGroupLayoutEntry e[2]{};
+        e[0].binding = 0;
+        e[0].visibility = wgpu::ShaderStage::Fragment;
+        e[0].texture.sampleType = wgpu::TextureSampleType::Float;
+        e[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+        e[1].binding = 1;
+        e[1].visibility = wgpu::ShaderStage::Fragment;
+        e[1].sampler.type = wgpu::SamplerBindingType::Filtering;
+        wgpu::BindGroupLayoutDescriptor bld{};
+        bld.entryCount = 2;
+        bld.entries = e;
+        mCompositeBgl = ctx.device.CreateBindGroupLayout(&bld);
+    }
+    if (!mCompositeSampler) {
+        wgpu::SamplerDescriptor sd{};
+        sd.magFilter = wgpu::FilterMode::Linear;
+        sd.minFilter = wgpu::FilterMode::Linear;
+        mCompositeSampler = ctx.device.CreateSampler(&sd);
+    }
+    if (!mOverlayPipeline || mOverlayLayoutKey != ctx.layout.key) {
+        auto module = MakeModule(ctx.device, CompositeWgsl, "Fast3D overlay composite");
+        wgpu::BlendState blend{};
+        blend.color = { wgpu::BlendOperation::Add, wgpu::BlendFactor::One, wgpu::BlendFactor::OneMinusSrcAlpha };
+        blend.alpha = { wgpu::BlendOperation::Add, wgpu::BlendFactor::One, wgpu::BlendFactor::OneMinusSrcAlpha };
+        wgpu::ColorTargetState cts[gfx::MaxColorAttachments]{};
+        for (uint32_t i = 0; i < ctx.layout.colorAttachmentCount; ++i) {
+            cts[i].format = ctx.layout.colorAttachments[i].format;
+            if (i == gfx::SceneColorAttachmentIndex) {
+                cts[i].blend = &blend;
+                cts[i].writeMask = wgpu::ColorWriteMask::All;
+            } else {
+                cts[i].writeMask = wgpu::ColorWriteMask::None;
+            }
+        }
+        wgpu::FragmentState fs{};
+        fs.module = module;
+        fs.entryPoint = "fs";
+        fs.targetCount = ctx.layout.colorAttachmentCount;
+        fs.targets = cts;
+        wgpu::DepthStencilState ds{};
+        ds.format = ctx.layout.depthStencilFormat;
+        ds.depthWriteEnabled = false; // in front of everything the host drew
+        ds.depthCompare = wgpu::CompareFunction::Always;
+        wgpu::PipelineLayoutDescriptor pld{};
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts = &mCompositeBgl;
+        wgpu::RenderPipelineDescriptor pd{};
+        pd.label = "Fast3D overlay composite";
+        pd.layout = ctx.device.CreatePipelineLayout(&pld);
+        pd.vertex.module = module;
+        pd.vertex.entryPoint = "vs";
+        pd.fragment = &fs;
+        pd.depthStencil = ctx.layout.depthStencilFormat == wgpu::TextureFormat::Undefined ? nullptr : &ds;
+        pd.multisample.count = ctx.layout.sampleCount;
+        mOverlayPipeline = ctx.device.CreateRenderPipeline(&pd);
+        mOverlayLayoutKey = ctx.layout.key;
+    }
+    if (view != mOverlayBoundView || !mOverlayBg) {
+        wgpu::BindGroupEntry be[2]{};
+        be[0].binding = 0;
+        be[0].textureView = wgpu::TextureView(view);
+        be[1].binding = 1;
+        be[1].sampler = mCompositeSampler;
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = mCompositeBgl;
+        bgd.entryCount = 2;
+        bgd.entries = be;
+        mOverlayBg = ctx.device.CreateBindGroup(&bgd);
+        mOverlayBoundView = view;
+    }
+    pass.SetPipeline(mOverlayPipeline);
+    pass.SetBindGroup(0, mOverlayBg);
+    pass.Draw(3);
+}
+
+extern "C" void gfx_aurora_set_overlay_fb(int fb) {
+    if (sHostedApi != nullptr) {
+        sHostedApi->SetOverlayFramebuffer(fb);
+    }
+}
+
+extern "C" int gfx_aurora_is_hosted(void) {
+    return sHostedApi != nullptr ? 1 : 0;
 }
 
 void GfxRenderingAPIAurora::RenderImGui(ImDrawData* data) {

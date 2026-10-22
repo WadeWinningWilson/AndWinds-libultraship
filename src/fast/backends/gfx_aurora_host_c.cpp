@@ -176,5 +176,10 @@ bool SetAuroraGfxHostC(const LusAuroraHostV1*) {
     return false; // no Aurora backend in this build
 }
 } // namespace Fast
+extern "C" int gfx_aurora_is_hosted(void) {
+    return 0;
+}
+extern "C" void gfx_aurora_set_overlay_fb(int) {
+}
 
 #endif
