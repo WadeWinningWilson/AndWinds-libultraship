@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <memory>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -154,6 +155,8 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
 
     // Render-worker callbacks (Aurora encoder task and custom draw).
     void ReplayFrame(const aurora::gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, uint32_t slot);
+    // Hosted: a frame the replay task owns (HostedFrame), never a slot the game thread may already reuse.
+    void ReplayHosted(const aurora::gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, void* frame);
     // Hosted: the game's 2D layer (its overlay display list, drawn into this framebuffer), composited over the
     // host's scene after it (ALBT&M: MM's message boxes, HUD and cutscene text in front of the visitor). -1 = none.
     void SetOverlayFramebuffer(int fb) {
@@ -321,6 +324,20 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     std::array<std::vector<UploadOp>, FrameSlots> mUploads;
     // Hosted (AuroraGfxIsHosted): uploads kept with their pixels for ReplayFromCpu.
     std::array<std::vector<PendingUpload>, FrameSlots> mHostedUploads;
+    // Hosted: each recorded frame handed to its replay task whole - ops, uploads and the views its composites
+    // sample - and freed only once replayed and several frames old. The host may run MM's frames later than four
+    // recordings (interpolated presents each record one; host frames without a scene pass): a reused slot was read
+    // freed (owner run 2026-10-22, a crash in a transition).
+    struct HostedFrame {
+        std::vector<PendingUpload> ups;
+        std::vector<PassOp> ops;
+        wgpu::TextureView composite;
+        wgpu::TextureView compositeDepth;
+        wgpu::TextureView overlay;
+        std::atomic<bool> replayed{ false };
+        uint32_t frame = 0;
+    };
+    std::deque<std::unique_ptr<HostedFrame>> mHostedFrames; // game thread only (the worker sets replayed)
     bool mHosted = false;
     // Framebuffer 0's view per slot: holds the reference the composite draw samples.
     std::array<wgpu::TextureView, FrameSlots> mCompositeViews;

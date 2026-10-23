@@ -176,6 +176,7 @@ GfxRenderingAPIAurora* sHostedApi = nullptr; // hosted: the backend gfx_aurora_s
 struct ReplayPayload {
     GfxRenderingAPIAurora* self;
     uint32_t slot;
+    void* hosted; // hosted: the HostedFrame this task owns (else null: the slot)
 };
 
 struct CompositePayload {
@@ -213,6 +214,10 @@ struct SelfTestPayload {
 void ReplayTrampoline(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, const void* payload,
                       size_t, void*) {
     const auto& p = *static_cast<const ReplayPayload*>(payload);
+    if (p.hosted != nullptr) {
+        p.self->ReplayHosted(ctx, cmd, p.hosted);
+        return;
+    }
     p.self->ReplayFrame(ctx, cmd, p.slot);
 }
 
@@ -985,6 +990,11 @@ void GfxRenderingAPIAurora::StartFrame() {
     mFrames[mRecordingSlot].clear();
     mUploads[mRecordingSlot].clear();
     mHostedUploads[mRecordingSlot].clear();
+    while (!mHostedFrames.empty() &&
+           ((mHostedFrames.front()->replayed && (mFrameCounter - mHostedFrames.front()->frame) > 8) ||
+            mHostedFrames.size() > 256)) { // a task never run (the host closed its queue) is let go eventually
+        mHostedFrames.pop_front();
+    }
     mImGuiThisFrame[mRecordingSlot] = false;
     mOverlayCleared[mRecordingSlot] = false;
     ++mFrameCountUniform;
@@ -1039,7 +1049,32 @@ void GfxRenderingAPIAurora::EndFrame() {
                     static_cast<unsigned long long>(mStatShaders), static_cast<unsigned long long>(mStatUploads),
                     static_cast<unsigned long long>(mStatSkippedDraws));
     }
-    const ReplayPayload rp{ this, mRecordingSlot };
+    if (mHosted) {
+        auto hf = std::make_unique<HostedFrame>();
+        hf->ups = std::move(mHostedUploads[mRecordingSlot]);
+        hf->ops = std::move(mFrames[mRecordingSlot]);
+        hf->frame = mFrameCounter;
+        const Framebuffer& fb0 = mFramebuffers[0];
+        hf->composite = fb0.colorView;
+        if (fb0.samples == 1 && fb0.depthView) {
+            hf->compositeDepth = fb0.depthView;
+        }
+        if (mOverlayCleared[mRecordingSlot] && mOverlayFb >= 0 && mOverlayFb < static_cast<int>(mFramebuffers.size())) {
+            hf->overlay = mFramebuffers[mOverlayFb].colorView;
+        }
+        const ReplayPayload rp{ this, mRecordingSlot, hf.get() };
+        AuroraGfx().pushEncoderTask(mReplayTask, &rp, sizeof(rp));
+        if (hf->composite) {
+            const CompositePayload cp{ this, hf->composite.Get(), hf->compositeDepth ? hf->compositeDepth.Get() : nullptr };
+            AuroraGfx().pushCustomDraw(mCompositeDraw, &cp, sizeof(cp));
+        }
+        if (hf->overlay) {
+            const CompositePayload op{ this, hf->overlay.Get(), nullptr };
+            AuroraGfx().pushCustomDraw(mOverlayDraw, &op, sizeof(op));
+        }
+        mHostedFrames.push_back(std::move(hf));
+    } else {
+    const ReplayPayload rp{ this, mRecordingSlot, nullptr };
     AuroraGfx().pushEncoderTask(mReplayTask, &rp, sizeof(rp));
     mCompositeViews[mRecordingSlot] = mFramebuffers[0].colorView;
     if (mCompositeViews[mRecordingSlot]) {
@@ -1053,6 +1088,7 @@ void GfxRenderingAPIAurora::EndFrame() {
         mOverlayViews[mRecordingSlot] = mFramebuffers[mOverlayFb].colorView;
         const CompositePayload op{ this, mOverlayViews[mRecordingSlot].Get(), nullptr };
         AuroraGfx().pushCustomDraw(mOverlayDraw, &op, sizeof(op));
+    }
     }
     if (mImGuiThisFrame[mRecordingSlot] && mImGuiFrames[mRecordingSlot] != nullptr) {
         const ImGuiPayload ip{ this, mRecordingSlot };
@@ -1464,6 +1500,13 @@ void GfxRenderingAPIAurora::SelectTextureFb(int fbId) {
 }
 
 // --- render worker ------------------------------------------------------------------
+
+void GfxRenderingAPIAurora::ReplayHosted(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd,
+                                         void* frame) {
+    auto* hf = static_cast<HostedFrame*>(frame);
+    ReplayFromCpu(ctx.device, ctx.queue, cmd, hf->ups, hf->ops);
+    hf->replayed = true;
+}
 
 void GfxRenderingAPIAurora::ReplayFrame(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd,
                                         uint32_t slot) {
