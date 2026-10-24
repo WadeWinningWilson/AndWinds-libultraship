@@ -183,5 +183,7 @@ extern "C" void gfx_aurora_set_overlay_fb(int) {
 }
 extern "C" void gfx_aurora_set_over_host_scene(int) {
 }
+extern "C" void gfx_aurora_set_world_fb(int) {
+}
 
 #endif

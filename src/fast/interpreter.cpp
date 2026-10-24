@@ -31,6 +31,7 @@
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
+#include "fast/backends/gfx_aurora_host_c.h"
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
@@ -5084,6 +5085,8 @@ void Interpreter::StartFrame() {
     } else {
         mRendersToFb = false;
     }
+    // Hosted: the framebuffer this frame's world is drawn into, for the host's composite (its depth with it).
+    gfx_aurora_set_world_fb(mRendersToFb ? mGameFb : 0);
 
     mFbActive = false;
 }

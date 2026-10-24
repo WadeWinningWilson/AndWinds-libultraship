@@ -84,6 +84,10 @@ void gfx_aurora_set_overlay_fb(int fb);
    its composite keeps what the game drew and depth tests it against the host's scene (writing its depth), instead of
    covering the host's frame. 0 = the game's world fills the frame (the default). */
 void gfx_aurora_set_over_host_scene(int on);
+/* The framebuffer the game drew its world into this frame: libultraship's own game framebuffer when it renders to one
+   (its viewport differs from its render size, or MSAA), else 0. The hosted composite takes that framebuffer's colour
+   and depth - framebuffer 0 then holds only a colour copy, and the world's depth was lost. Set by the interpreter. */
+void gfx_aurora_set_world_fb(int fb);
 
 #ifdef __cplusplus
 }

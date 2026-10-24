@@ -1072,7 +1072,11 @@ void GfxRenderingAPIAurora::EndFrame() {
         hf->ups = std::move(mHostedUploads[mRecordingSlot]);
         hf->ops = std::move(mFrames[mRecordingSlot]);
         hf->frame = mFrameCounter;
-        const Framebuffer& fb0 = mFramebuffers[0];
+        // The framebuffer the game drew its world into, with its own depth; framebuffer 0 when that one is
+        // multisampled (no depth composite then) or unknown.
+        const bool worldFbUsable = mWorldFb > 0 && mWorldFb < static_cast<int>(mFramebuffers.size()) &&
+                                   mFramebuffers[mWorldFb].samples == 1 && mFramebuffers[mWorldFb].colorView;
+        const Framebuffer& fb0 = mFramebuffers[worldFbUsable ? mWorldFb : 0];
         hf->composite = fb0.colorView;
         if (fb0.samples == 1 && fb0.depthView) {
             hf->compositeDepth = fb0.depthView;
@@ -2022,6 +2026,12 @@ extern "C" int gfx_aurora_is_hosted(void) {
 extern "C" void gfx_aurora_set_over_host_scene(int on) {
     if (sHostedApi != nullptr) {
         sHostedApi->SetOverHostScene(on != 0);
+    }
+}
+
+extern "C" void gfx_aurora_set_world_fb(int fb) {
+    if (sHostedApi != nullptr) {
+        sHostedApi->SetWorldFramebuffer(fb);
     }
 }
 

@@ -174,6 +174,10 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     void SetOverHostScene(bool on) {
         mOverHost = on;
     }
+    // Hosted: the framebuffer the game drew its world into this frame (gfx_aurora_set_world_fb); 0 = framebuffer 0.
+    void SetWorldFramebuffer(int fb) {
+        mWorldFb = fb;
+    }
     void SelfTestCopy(const wgpu::CommandEncoder& cmd, WGPUTexture texture);
     // libultraship's ImGui: copied on the game thread (Fast3dGui::ImGuiRenderDrawData),
     // drawn by imgui_impl_wgpu into Aurora's scene pass after the game composite.
@@ -316,6 +320,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     aurora::gfx::DrawTypeId mOverlayDraw = aurora::gfx::InvalidDrawType; // "Fast3D overlay composite"
     int mOverlayFb = -1;
     bool mOverHost = false;
+    int mWorldFb = 0;
     std::array<bool, FrameSlots> mOverlayCleared{}; // the 2D layer cleared to transparent this frame
     std::array<wgpu::TextureView, FrameSlots> mOverlayViews;
     wgpu::RenderPipeline mOverlayPipeline;
