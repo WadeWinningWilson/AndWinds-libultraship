@@ -117,6 +117,23 @@ struct FO { @location(0) c: vec4f, @builtin(frag_depth) z: f32 };
   }
   return o;
 }
+// HR-31: the game's player in the host's world - only what the game drew (cleared depth is nothing), depth tested.
+@fragment fn fs_over(i: VO) -> FO {
+  var o: FO;
+  let size = vec2i(textureDimensions(d));
+  let texel = clamp(vec2i(i.uv * vec2f(size)), vec2i(0), size - vec2i(1));
+  let dz = textureLoad(d, texel, 0);
+  if (dz >= 1.0) {
+    discard;
+  }
+  o.c = textureSample(t, s, i.uv);
+  let n = u.view.x;
+  let f = u.view.y;
+  let dist = 2.0 * f * n / ((f + n) - (dz * 2.0 - 1.0) * (f - n));
+  let zv = -dist / u.view.z;
+  o.z = clamp((u.proj.x * zv + u.proj.y) / (u.proj.z * zv + u.proj.w), 0.0, 1.0);
+  return o;
+}
 )";
 
 // Texture upload: words[0] = width, words[1] = height, then RGBA8 pixels.
@@ -183,6 +200,7 @@ struct CompositePayload {
     GfxRenderingAPIAurora* self;
     WGPUTextureView view;
     WGPUTextureView depth; // framebuffer 0's depth, for a hosted world's composite (null: colour only)
+    uint32_t overHost;     // HR-31: the game's player over the host's scene (gfx_aurora_set_over_host_scene)
 };
 
 struct ImGuiPayload {
@@ -224,7 +242,7 @@ void ReplayTrampoline(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEnc
 void CompositeTrampoline(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void* payload,
                          size_t, void*) {
     const auto& p = *static_cast<const CompositePayload*>(payload);
-    p.self->DrawComposite(ctx, pass, p.view, p.depth);
+    p.self->DrawComposite(ctx, pass, p.view, p.depth, p.overHost != 0);
 }
 
 void OverlayTrampoline(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void* payload, size_t,
@@ -1065,11 +1083,12 @@ void GfxRenderingAPIAurora::EndFrame() {
         const ReplayPayload rp{ this, mRecordingSlot, hf.get() };
         AuroraGfx().pushEncoderTask(mReplayTask, &rp, sizeof(rp));
         if (hf->composite) {
-            const CompositePayload cp{ this, hf->composite.Get(), hf->compositeDepth ? hf->compositeDepth.Get() : nullptr };
+            const CompositePayload cp{ this, hf->composite.Get(), hf->compositeDepth ? hf->compositeDepth.Get() : nullptr,
+                                       mOverHost ? 1u : 0u };
             AuroraGfx().pushCustomDraw(mCompositeDraw, &cp, sizeof(cp));
         }
         if (hf->overlay) {
-            const CompositePayload op{ this, hf->overlay.Get(), nullptr };
+            const CompositePayload op{ this, hf->overlay.Get(), nullptr, 0u };
             AuroraGfx().pushCustomDraw(mOverlayDraw, &op, sizeof(op));
         }
         mHostedFrames.push_back(std::move(hf));
@@ -1080,13 +1099,14 @@ void GfxRenderingAPIAurora::EndFrame() {
     if (mCompositeViews[mRecordingSlot]) {
         const Framebuffer& fb0 = mFramebuffers[0];
         const CompositePayload cp{ this, mCompositeViews[mRecordingSlot].Get(),
-                                   mHosted && fb0.samples == 1 && fb0.depthView ? fb0.depthView.Get() : nullptr };
+                                   mHosted && fb0.samples == 1 && fb0.depthView ? fb0.depthView.Get() : nullptr,
+                                   mOverHost ? 1u : 0u };
         AuroraGfx().pushCustomDraw(mCompositeDraw, &cp, sizeof(cp));
     }
     if (mOverlayCleared[mRecordingSlot] && mOverlayFb >= 0 && mOverlayFb < static_cast<int>(mFramebuffers.size()) &&
         mFramebuffers[mOverlayFb].colorView) {
         mOverlayViews[mRecordingSlot] = mFramebuffers[mOverlayFb].colorView;
-        const CompositePayload op{ this, mOverlayViews[mRecordingSlot].Get(), nullptr };
+        const CompositePayload op{ this, mOverlayViews[mRecordingSlot].Get(), nullptr, 0u };
         AuroraGfx().pushCustomDraw(mOverlayDraw, &op, sizeof(op));
     }
     }
@@ -1700,7 +1720,7 @@ void GfxRenderingAPIAurora::ReplayFromCpu(const wgpu::Device& device, const wgpu
 }
 
 bool GfxRenderingAPIAurora::DrawWorldComposite(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
-                                               WGPUTextureView view, WGPUTextureView depthView) {
+                                               WGPUTextureView view, WGPUTextureView depthView, bool overHost) {
     float projZ[4], worldScale = 1.0f, zNear = 0.0f, zFar = 0.0f;
     if (!AuroraGfx().worldDepth(projZ, &worldScale) || !AuroraWorldDepthRange(&zNear, &zFar) || worldScale <= 0.0f ||
         ctx.layout.depthStencilFormat == wgpu::TextureFormat::Undefined) {
@@ -1769,6 +1789,40 @@ bool GfxRenderingAPIAurora::DrawWorldComposite(const gfx::DrawContext& ctx, cons
         pd.multisample.count = ctx.layout.sampleCount;
         mWorldPipeline = ctx.device.CreateRenderPipeline(&pd);
         mWorldLayoutKey = ctx.layout.key;
+        mWorldOverLayoutKey = ~0ull;
+    }
+    if (overHost && (!mWorldOverPipeline || mWorldOverLayoutKey != ctx.layout.key)) {
+        // HR-31: the same composite, but only the game's drawn texels, tested against the host's depth (and written).
+        auto module = MakeModule(ctx.device, WorldCompositeWgsl, "Fast3D player over host");
+        wgpu::ColorTargetState cts[gfx::MaxColorAttachments]{};
+        for (uint32_t i = 0; i < ctx.layout.colorAttachmentCount; ++i) {
+            cts[i].format = ctx.layout.colorAttachments[i].format;
+            cts[i].writeMask =
+                i == gfx::SceneColorAttachmentIndex ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None;
+        }
+        wgpu::FragmentState fs{};
+        fs.module = module;
+        fs.entryPoint = "fs_over";
+        fs.targetCount = ctx.layout.colorAttachmentCount;
+        fs.targets = cts;
+        wgpu::DepthStencilState ds{};
+        ds.format = ctx.layout.depthStencilFormat;
+        ds.depthWriteEnabled = true;
+        ds.depthCompare = AuroraGfx().usesReversedZ() ? wgpu::CompareFunction::GreaterEqual
+                                                      : wgpu::CompareFunction::LessEqual;
+        wgpu::PipelineLayoutDescriptor pld{};
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts = &mWorldBgl;
+        wgpu::RenderPipelineDescriptor pd{};
+        pd.label = "Fast3D player over host";
+        pd.layout = ctx.device.CreatePipelineLayout(&pld);
+        pd.vertex.module = module;
+        pd.vertex.entryPoint = "vs";
+        pd.fragment = &fs;
+        pd.depthStencil = &ds;
+        pd.multisample.count = ctx.layout.sampleCount;
+        mWorldOverPipeline = ctx.device.CreateRenderPipeline(&pd);
+        mWorldOverLayoutKey = ctx.layout.key;
     }
     // proj (host z / w rows along the view axis), then near, far, world units per host unit, reversed-Z.
     const float u[8] = { projZ[0], projZ[1], projZ[2], projZ[3],
@@ -1793,16 +1847,19 @@ bool GfxRenderingAPIAurora::DrawWorldComposite(const gfx::DrawContext& ctx, cons
         mWorldBoundView = view;
         mWorldBoundDepth = depthView;
     }
-    pass.SetPipeline(mWorldPipeline);
+    pass.SetPipeline(overHost ? mWorldOverPipeline : mWorldPipeline);
     pass.SetBindGroup(0, mWorldBg);
     pass.Draw(3);
     return true;
 }
 
 void GfxRenderingAPIAurora::DrawComposite(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
-                                          WGPUTextureView view, WGPUTextureView depthView) {
-    if (depthView != nullptr && DrawWorldComposite(ctx, pass, view, depthView)) {
+                                          WGPUTextureView view, WGPUTextureView depthView, bool overHost) {
+    if (depthView != nullptr && DrawWorldComposite(ctx, pass, view, depthView, overHost)) {
         return;
+    }
+    if (overHost) {
+        return; // the player over the host's scene needs the host camera's depth: nothing drawn rather than a cover
     }
     if (!mCompositePipeline || mCompositeLayoutKey != ctx.layout.key) {
         if (!mCompositeBgl) {
@@ -1960,6 +2017,12 @@ extern "C" void gfx_aurora_set_overlay_fb(int fb) {
 
 extern "C" int gfx_aurora_is_hosted(void) {
     return sHostedApi != nullptr ? 1 : 0;
+}
+
+extern "C" void gfx_aurora_set_over_host_scene(int on) {
+    if (sHostedApi != nullptr) {
+        sHostedApi->SetOverHostScene(on != 0);
+    }
 }
 
 void GfxRenderingAPIAurora::RenderImGui(ImDrawData* data) {

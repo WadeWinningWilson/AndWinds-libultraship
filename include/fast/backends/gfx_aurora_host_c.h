@@ -80,6 +80,10 @@ int gfx_aurora_is_hosted(void);
 /* The game's 2D layer (a framebuffer it draws its overlay display list into, -1 = none): composited over the
    host's scene after it, alpha blended, never depth tested ("Fast3D overlay composite"). */
 void gfx_aurora_set_overlay_fb(int fb);
+/* HR-31 (ALBT&M: MM Link in the host's world): framebuffer 0 holds only the game's player over a cleared background;
+   its composite keeps what the game drew and depth tests it against the host's scene (writing its depth), instead of
+   covering the host's frame. 0 = the game's world fills the frame (the default). */
+void gfx_aurora_set_over_host_scene(int on);
 
 #ifdef __cplusplus
 }

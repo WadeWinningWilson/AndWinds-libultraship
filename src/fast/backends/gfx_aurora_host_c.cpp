@@ -181,5 +181,7 @@ extern "C" int gfx_aurora_is_hosted(void) {
 }
 extern "C" void gfx_aurora_set_overlay_fb(int) {
 }
+extern "C" void gfx_aurora_set_over_host_scene(int) {
+}
 
 #endif

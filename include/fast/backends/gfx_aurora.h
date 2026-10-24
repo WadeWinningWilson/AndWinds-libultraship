@@ -165,10 +165,15 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     void DrawOverlayComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
                               WGPUTextureView view);
     void DrawComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
-                       WGPUTextureView view, WGPUTextureView depthView = nullptr);
-    // Hosted world (ALBT&W HR10-Q4): framebuffer 0 composited with its depth turned into the host camera's.
+                       WGPUTextureView view, WGPUTextureView depthView = nullptr, bool overHost = false);
+    // Hosted world (ALBT&W HR10-Q4): framebuffer 0 composited with its depth turned into the host camera's. overHost
+    // (HR-31, the game's player in the host's world): only what the game drew, depth tested against the host scene.
     bool DrawWorldComposite(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
-                            WGPUTextureView view, WGPUTextureView depthView);
+                            WGPUTextureView view, WGPUTextureView depthView, bool overHost = false);
+    // HR-31: the game draws its player into the host's world (gfx_aurora_set_over_host_scene).
+    void SetOverHostScene(bool on) {
+        mOverHost = on;
+    }
     void SelfTestCopy(const wgpu::CommandEncoder& cmd, WGPUTexture texture);
     // libultraship's ImGui: copied on the game thread (Fast3dGui::ImGuiRenderDrawData),
     // drawn by imgui_impl_wgpu into Aurora's scene pass after the game composite.
@@ -310,6 +315,7 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     aurora::gfx::DrawTypeId mCompositeDraw = aurora::gfx::InvalidDrawType;
     aurora::gfx::DrawTypeId mOverlayDraw = aurora::gfx::InvalidDrawType; // "Fast3D overlay composite"
     int mOverlayFb = -1;
+    bool mOverHost = false;
     std::array<bool, FrameSlots> mOverlayCleared{}; // the 2D layer cleared to transparent this frame
     std::array<wgpu::TextureView, FrameSlots> mOverlayViews;
     wgpu::RenderPipeline mOverlayPipeline;
@@ -403,6 +409,8 @@ class GfxRenderingAPIAurora final : public GfxRenderingAPI {
     wgpu::BindGroup mCompositeBg;
     wgpu::RenderPipeline mWorldPipeline;
     uint64_t mWorldLayoutKey = ~0ull;
+    wgpu::RenderPipeline mWorldOverPipeline;
+    uint64_t mWorldOverLayoutKey = ~0ull;
     wgpu::BindGroupLayout mWorldBgl;
     wgpu::Buffer mWorldUniforms;
     wgpu::BindGroup mWorldBg;
