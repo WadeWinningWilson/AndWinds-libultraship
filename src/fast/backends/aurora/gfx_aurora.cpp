@@ -1392,10 +1392,9 @@ GfxRenderingAPIAurora::GetPixelDepth(int fb_id, const std::set<std::pair<float, 
         return res;
     }
     if (mHosted) {
-        // Hosted: as ReadFramebufferToCPU; answer "nothing in front" (the far value, as MM's sky reads).
-        for (auto& [c, d] : res) {
-            d = 0xFFFC;
-        }
+        // Hosted: as ReadFramebufferToCPU, there is no depth of our own to read (the frame is composited into the
+        // host's). Answer "something in front" (0, the nearest value): every occlusion test (sun glare, light glows)
+        // then treats its point as hidden, as MM does behind a wall, rather than drawing through walls.
         return res;
     }
     // E4: MM asks before this frame's Run, so this is the last completed frame's
